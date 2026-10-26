@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Wallpicker
+Comment=Browse and apply wallpapers
+Exec=wallpicker
+Terminal=false
+Categories=Utility;Graphics;
+StartupWMClass=wallpicker

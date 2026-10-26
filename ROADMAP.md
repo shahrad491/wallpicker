@@ -2,7 +2,7 @@
 
 A Rust wallpaper picker for Hyprland, replacing the current rofi + `wallpaper.sh` flow.
 
-**Status:** Planning complete. Implementation not started.
+**Status:** M0–M7 implementation complete; M8 automated QA and release build complete. Live desktop acceptance and user-applied installation/wiring remain pending.
 **Target:** Linux / Wayland / Hyprland on CachyOS. Rust stable.
 **Binary:** `wallpicker`
 **Primary config:** `~/.config/wallpicker/config.toml`
@@ -50,7 +50,7 @@ A fast, keyboard-friendly image picker with a real category system instead of a 
 
 ### Open questions (blocking only at the end)
 
-- [ ] Initialize a git repository? (recommended before multi-agent work)
+- [x] Existing git repository detected and retained; no initialization or commits performed.
 - [ ] Whether the README snippets are wired in by the user or the agent (default: user wires them; agent only installs the binary when asked)
 
 ---
@@ -179,150 +179,167 @@ Behavior:
 
 ## 5. Milestones
 
-### M0 — Bootstrap and shared contracts
+### M0 — Bootstrap and shared contracts — @codex-core
 
-- [ ] `cargo init --name wallpicker`
-- [ ] Add dependencies and feature flags
-- [ ] Create module skeletons with doc comments and explicit public APIs
-- [ ] Path helpers + XDG-aware directories (injectable for tests)
-- [ ] Logging setup and panic hook
-- [ ] CI-style local checks documented: `fmt`, `clippy`, `test`
-- [ ] Optional: `git init`, `.gitignore` (`/target`, `*.log`)
+- [x] Initialize the `wallpicker` Cargo package
+- [x] Add dependencies and feature flags
+- [x] Create module skeletons with doc comments and explicit public APIs
+- [x] Path helpers + XDG-aware directories (injectable for tests)
+- [x] Logging setup and panic hook
+- [x] CI-style local checks documented: `fmt`, `clippy`, `test`
+- [x] Existing git repository retained; `.gitignore` added (`/target`, `/.cache`, `*.log`); no initialization or commits
+
+**Implementation:** complete; real-desktop acceptance is tracked under M8.
 
 **Done when:** `cargo check` passes, `wallpicker --version` works, module boundaries are agreed.
 
 ---
 
-### M1 — Config, store, and error model
+### M1 — Config, store, and error model — @codex-core
 
 Depends on M0.
 
-- [ ] `config.rs`: defaults, load, save, invalid-value fallback, validation
-- [ ] `store.rs`: load, save, atomic write, `version` field, corrupt-file backup
-- [ ] Operations: `add_category`, `rename_category`, `delete_category`, `add_to_category`, `remove_from_category`, `toggle_favorite`, `set_last_category`
-- [ ] Favorites protection and duplicate-name rules
-- [ ] Prune operations by source / missing files
-- [ ] Unit tests for every operation and for recovery
+- [x] `config.rs`: defaults, load, save, invalid-value fallback, validation
+- [x] `store.rs`: load, save, atomic write, `version` field, corrupt-file backup
+- [x] Operations: `add_category`, `rename_category`, `delete_category`, `add_to_category`, `remove_from_category`, `toggle_favorite`, `set_last_category`
+- [x] Favorites protection and duplicate-name rules
+- [x] Prune operations by source / missing files
+- [x] Unit tests for every operation and for recovery
+
+**Implementation:** complete; real-desktop acceptance is tracked under M8.
 
 **Done when:** library operations are exhaustively tested; corrupt JSON never silently overwrites user data.
 
 ---
 
-### M2 — Scanner and derived categories
+### M2 — Scanner and derived categories — @codex-core
 
 Depends on M1.
 
-- [ ] Walk sources (`walkdir`, optional recursion, no symlink loops)
-- [ ] Filter image extensions: png, jpg, jpeg, webp, gif, bmp, tif, tiff
-- [ ] Canonicalize, dedupe, collect `{ path, mtime, size, parent, source }`
-- [ ] Build auto categories from immediate subfolders, merging same names
-- [ ] Skip empty folders; apply hidden list
-- [ ] Detect duplicate/nested sources when adding
-- [ ] Scan result summary (count, skipped, duration)
-- [ ] Tests with generated temp trees
+- [x] Walk sources (`walkdir`, optional recursion, no symlink loops)
+- [x] Filter image extensions: png, jpg, jpeg, webp, gif, bmp, tif, tiff
+- [x] Canonicalize, dedupe, collect `{ path, mtime, size, parent, source }`
+- [x] Build auto categories from immediate subfolders, merging same names
+- [x] Skip empty folders; apply hidden list
+- [x] Detect duplicate/nested sources when adding
+- [x] Scan result summary (count, skipped, duration)
+- [x] Tests with generated temp trees
+
+**Implementation:** complete; real-desktop acceptance is tracked under M8.
 
 **Done when:** scanning `~/Pictures/wallpaper` (~1,300 files, 4 top folders) produces the expected pool and folder categories.
 
 ---
 
-### M3 — Thumbnail service
+### M3 — Thumbnail service — @codex-media
 
 Depends on M0/M2 types; can run in parallel with M4.
 
-- [ ] Cache key: `blake3(canonical path | mtime | size | target dims)`
-- [ ] Decode, EXIF-orient, cover-crop, resize (400×225), JPEG encode
-- [ ] Bounded worker pool (`workers`, default 4), dedupe requests
-- [ ] Progressive delivery to UI; placeholder while pending
-- [ ] Failure cache that invalidates on mtime/size change
-- [ ] Cleanup of orphaned cache files (manual action)
-- [ ] Tests: hit, miss, invalidation, unreadable file
+- [x] Cache key: `blake3(canonical path | mtime | size | target dims)`
+- [x] Decode, EXIF-orient, cover-crop, resize (400×225), JPEG encode
+- [x] Bounded worker pool (`workers`, default 4), dedupe requests
+- [x] Progressive delivery to UI; placeholder while pending
+- [x] Failure cache that invalidates on mtime/size change
+- [x] Cleanup of orphaned cache files (manual action)
+- [x] Tests: hit, miss, invalidation, unreadable file
+
+**Implementation:** complete; real-desktop acceptance is tracked under M8.
 
 **Done when:** second launch after full generation renders the whole collection without regenerating thumbnails.
 
 ---
 
-### M4 — Wallpaper backend and headless CLI
+### M4 — Wallpaper backend and headless CLI — @codex-media
 
 Depends on M0/M1; parallel with M2/M3.
 
-- [ ] Reuse `awww` namespace `dotfiles`; detect daemon via `awww query --namespace dotfiles`
-- [ ] Start `awww-daemon` detached (`setsid`, logs to cache) when missing
-- [ ] Apply with configured transition/duration/resize, matching current script
-- [ ] `swaybg` fallback with PID/start-time tracking
-- [ ] Atomic legacy state write
-- [ ] `notify-send` success/critical failure notifications
-- [ ] `restore`, `set`, `random --category`, `rescan`
-- [ ] CLI tests where practical (argument parsing, selection logic)
+- [x] Reuse `awww` namespace `dotfiles`; detect daemon via `awww query --namespace dotfiles`
+- [x] Start `awww-daemon` detached (`setsid`, logs to cache) when missing
+- [x] Apply with configured transition/duration/resize, matching current script
+- [x] `swaybg` fallback with PID/start-time tracking
+- [x] Atomic legacy state write
+- [x] `notify-send` success/critical failure notifications
+- [x] `restore`, `set`, `random --category`, `rescan`
+- [x] CLI tests where practical (argument parsing, selection logic)
+
+**Implementation:** complete; real-desktop acceptance is tracked under M8.
 
 **Done when:** `wallpicker set`, `restore`, and `random` work without opening a window; the old script and new binary can alternate safely.
 
 ---
 
-### M5 — Iced shell and visual design
+### M5 — Iced shell and visual design — @codex-ui
 
 Depends on M1/M2; UI can start against fixture data.
 
-- [ ] Iced 0.14 application skeleton, window settings, app id `wallpicker`
-- [ ] Borderless window sized from `hyprctl monitors -j` (focused monitor, scale-aware), fallback 1200×800
-- [ ] Custom theme from config palette; rofi-like dark look
-- [ ] Sidebar: All, Favorites, Categories, Folders, Sources + counts
-- [ ] Toolbar: search, sort, Random, Rescan
-- [ ] Grid: fluid columns, 16:9 tile, hover star, current-wallpaper badge
-- [ ] Empty/loading/error states
-- [ ] Single-instance lock + focus existing window
+- [x] Iced 0.14 application skeleton, window settings, app id `wallpicker`
+- [x] Borderless window sized from `hyprctl monitors -j` (focused monitor, scale-aware), fallback 1200×800
+- [x] Custom theme from config palette; rofi-like dark look
+- [x] Sidebar: All, Favorites, Categories, Folders, Sources + counts
+- [x] Toolbar: search, sort, Random, Rescan
+- [x] Grid: fluid columns, 16:9 tile, hover star, current-wallpaper badge
+- [x] Empty/loading/error states
+- [x] Single-instance lock + focus existing window
+
+**Implementation:** complete; real-desktop acceptance is tracked under M8.
 
 **Done when:** app opens with real data, is keyboard-dismissable, and looks intentional at both 1080p scales (1.0 and 1.5).
 
 ---
 
-### M6 — Gallery interactions
+### M6 — Gallery interactions — @codex-ui
 
 Depends on M5.
 
-- [ ] Click select, Ctrl-click toggle, Shift-click range, double-click / Enter apply (single click only selects)
-- [ ] Hover actions: favorite, add to category, more
-- [ ] Right-click context menu (iced `float`): apply, favorite, add to category submenu, remove from current category, reveal, copy path
-- [ ] Batch toolbar for selections: favorite, add, remove, clear
-- [ ] Keyboard: arrows/hjkl, Enter, Space, R, `/`, Ctrl+A, Ctrl+D, Esc
-- [ ] Search filter + Name/Newest/Oldest sorting
-- [ ] In-app random from current category, avoids repeat when possible
-- [ ] Apply → close + toast; failure → stay open with error banner
-- [ ] Last category persisted on sidebar change
+- [x] Click select, Ctrl-click toggle, Shift-click range, double-click / Enter apply (single click only selects)
+- [x] Hover actions: favorite, add to category, more
+- [x] Right-click context menu (iced `float`): apply, favorite, add to category submenu, remove from current category, reveal, copy path
+- [x] Batch toolbar for selections: favorite, add, remove, clear
+- [x] Keyboard: arrows/hjkl, Enter, Space, R, `/`, Ctrl+A, Ctrl+D, Esc
+- [x] Search filter + Name/Newest/Oldest sorting
+- [x] In-app random from current category, avoids repeat when possible
+- [x] Apply → close + toast; failure → stay open with error banner
+- [x] Last category persisted on sidebar change
+
+**Implementation:** complete; real-desktop acceptance is tracked under M8.
 
 **Done when:** the picker can be driven entirely by keyboard or entirely by mouse for every core action.
 
 ---
 
-### M7 — Category and source management
+### M7 — Category and source management — @codex-ui
 
 Depends on M1/M5/M6.
 
-- [ ] New category dialog + validation
-- [ ] Rename (F2 / context menu)
-- [ ] Delete with count confirmation; files untouched
-- [ ] Multi-select add/remove to manual category
-- [ ] Favorites cannot be renamed/deleted (UI affordance hidden/disabled)
-- [ ] Auto categories: hide/unhide, explain regeneration
-- [ ] Source manager: add (path + Browse… via zenity), recursive toggle, auto-category toggle, remove
-- [ ] Remove source confirmation explaining membership pruning
-- [ ] "Clean up missing entries" action
-- [ ] Rescan feedback and progress
+- [x] New category dialog + validation
+- [x] Rename (F2 / context menu)
+- [x] Delete with count confirmation; files untouched
+- [x] Multi-select add/remove to manual category
+- [x] Favorites cannot be renamed/deleted (UI affordance hidden/disabled)
+- [x] Auto categories: hide/unhide, explain regeneration
+- [x] Source manager: add (path + Browse… via zenity), recursive toggle, auto-category toggle, remove
+- [x] Remove source confirmation explaining membership pruning
+- [x] "Clean up missing entries" action
+- [x] Rescan feedback and progress
+
+**Implementation:** complete; real-desktop acceptance is tracked under M8.
 
 **Done when:** every CRUD path in the decision table is reachable and has a confirmation or undo-safe behavior.
 
 ---
 
-### M8 — QA, performance, packaging
+### M8 — QA, performance, packaging — @codex-core
 
 - [ ] Run against the full 1,300-image collection; measure open time and scroll smoothness
-- [ ] If grid is slow: enable `lazy` tiles and/or chunked rendering
+- [x] Viewport virtualization implemented; offscreen rows use spacers (live smoothness still pending)
 - [ ] Test scale factor 1.5 (`eDP-1`) and multi-monitor focus
 - [ ] Test awww transitions and swaybg fallback (temporarily hide awww)
 - [ ] Test restore at login, single instance, corrupt library, missing images
-- [ ] `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`
-- [ ] Release build, install to `~/.local/bin/wallpicker`
-- [ ] Optional desktop entry with `StartupWMClass=wallpicker`
-- [ ] `README.md`: install/build, every CLI command, in-app keyboard shortcuts, config reference, data locations, and copy-paste Hyprland keybind/autostart/window-rule snippets
+- [x] `cargo fmt --check`, `cargo clippy --offline --all-targets -- -D warnings`, `cargo test --offline` (54 tests)
+- [x] Release build: `target/release/wallpicker` (about 28.7 MB); help/version/rescan smoke passed
+- [ ] Install to `~/.local/bin/wallpicker` (only after explicit permission)
+- [x] Optional desktop entry provided in `assets/wallpicker.desktop` (not installed)
+- [x] `README.md`: install/build, every CLI command, in-app keyboard shortcuts, config reference, data locations, and copy-paste Hyprland keybind/autostart/window-rule snippets
 - [ ] Verify the README snippets work in a real Hyprland config before declaring M8 done
 - [ ] Hyprland wiring is **user-applied from the README** by default; only edit dotfiles with explicit permission, with backups
   - replace `$mainMod, W` rofi/script bind with `wallpicker`
@@ -334,6 +351,30 @@ Depends on M1/M5/M6.
 **Done when:** you can use wallpicker daily and the old script is a fallback, not the default.
 
 ---
+
+### Implementation and validation notes (2026-10-26)
+
+- Core, media, UI, and QA followed the track ownership below. M0–M7 checkboxes record
+  implemented behavior; their real-session acceptance criteria remain part of M8.
+- `Backend` and `Thumbnailer` retain the documented wrappers/contracts and add injectable
+  constructors so tests never invoke real desktop tools or write to user XDG directories.
+- Ctrl+P opens a searchable keyboard command palette for all management/sidebar actions.
+  Search Enter returns to gallery selection. Context menus use Iced float overlays.
+- Stored manual tags are preserved when recursion is disabled and become visible in the
+  gallery again when their source is scanned recursively. New membership checks still
+  require an image in an enabled source scope.
+- `--no-rescan` reuses stored manual/Favorites lists. All/folders and empty-list fallback
+  still scan because the derived pool is intentionally not persisted.
+- Real collection scan through the CLI: **1,294 images, 4 folders, 0 skipped, 55 ms**
+  (debug build, isolated XDG storage). This does not measure thumbnail or window open time.
+- Bounded GUI smoke attempt could not create a Wayland connection in the sandbox
+  (`NoCompositor`); `hyprctl` also could not connect. No window remained running and no
+  real wallpaper application, autostart, or Hyprland configuration change was performed.
+- User confirmed the real window opens and wallpaper application succeeds. Their first
+  attended test found selection resetting scroll and slow/missing previews; fixes keep
+  widget state stable and prioritize visible-row previews. M8 still requires a repeat
+  attended check of layout/scrolling/scale, real backend transitions
+  and login restore, second-instance focus, and README wiring in the user's session.
 
 ## 6. Parallel work plan
 
@@ -357,19 +398,19 @@ Rules:
 
 ## 7. Verification checklist
 
-- [ ] Favorites cannot be deleted or renamed, by UI or model API
-- [ ] Deleting a category never deletes an image
-- [ ] Removing a source prompts and prunes all memberships
-- [ ] Auto categories merge, hide, and regenerate correctly
-- [ ] Manual category with a missing file hides it without losing the entry
-- [ ] Random uses the last GUI category; fallbacks are sane
+- [x] Favorites cannot be deleted or renamed, by UI or model API
+- [x] Deleting a category never deletes an image
+- [x] Removing a source prompts and prunes all memberships
+- [x] Auto categories merge, hide, and regenerate correctly
+- [x] Manual category with a missing file hides it without losing the entry
+- [x] Random uses the last GUI category; fallbacks are sane
 - [ ] Apply writes legacy state and shows a toast
 - [ ] Restore at login works headlessly
-- [ ] Thumbnail cache survives restart and invalidates on file change
+- [x] Thumbnail cache survives restart and invalidates on file change
 - [ ] 1,300 images open and scroll acceptably
 - [ ] 1.5 scale factor window fits the screen
 - [ ] No second instance opens; existing window focuses
-- [ ] Corrupt library does not destroy data
+- [x] Corrupt library does not destroy data
 - [ ] Old `wallpaper.sh` still works during transition
 
 ---
@@ -396,3 +437,10 @@ Append one line per completed milestone/task group.
 |---|---|---|
 | 2026-10-26 | Planning | Roadmap + AGENTS.md created |
 | 2026-10-26 | Docs | README.md added: CLI, in-app controls, config, data paths, Hyprland wiring snippets; click behavior fixed (single selects, double applies) |
+| 2026-10-26 | M0–M2 / core | Cargo package, stable contracts, XDG paths/logging, validated config, private atomic library/recovery, canonical scanning and metadata operations implemented; real collection scan 1,294 images / 4 folders / 55 ms. |
+| 2026-10-26 | M3–M4 / media | Bounded thumbnail workers with EXIF/cache/failure tests; injectable awww/swaybg backend, legacy state/PID handling, quiet restore, random fallback, notifications. |
+| 2026-10-26 | M5–M7 / UI | Iced shell, virtualized gallery, keyboard command palette, floating context menu, CRUD/confirmations, serialized saves and queued scans, visible errors and close-after-save. |
+| 2026-10-26 | M8 / automated QA | 50 tests pass (generated images, injected tools, isolated XDG); fmt and all-target Clippy with warnings denied pass. CLI help/version/rescan smoke passed; bounded GUI smoke blocked by sandbox NoCompositor. Desktop acceptance requested from user. |
+| 2026-10-26 | M8 / release | Optimized binary built (28,675,496 bytes); isolated version/rescan smoke passed: 1,294 images, 4 folders, 0 skipped, 54 ms. Installation, compositor acceptance, and wiring intentionally pending. |
+| 2026-10-26 | M8 / user desktop test | User confirmed picker opens and applies wallpaper; reported click resetting scroll and most previews missing. Diagnosed Iced child-index state replacement and slow unoptimized full-collection thumbnail queue. Fixes: stable widget tree, viewport priority/cancellation, faster cover-crop area downsampling, optimized dev dependencies, readiness feedback; 54 tests, fmt, and all-target Clippy with warnings denied pass. |
+| 2026-10-26 | M8 / gallery fixes validated | 54 tests pass, including widget-tree preservation through selection/errors/dialogs, viewport bounds after category changes, crop correctness, and stale thumbnail cancellation. Fmt and all-target Clippy pass. Optimized-dependency sample: 1080p PNG thumbnail pipeline approximately 12.5–20.4 ms; existing cache reused. Repeat attended test requested via updated binary. |

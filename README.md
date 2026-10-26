@@ -4,8 +4,9 @@ A fast, keyboard-friendly wallpaper picker for **Hyprland/Wayland**, written in 
 It replaces the rofi + bash gallery with real categories, favorites, folder sources, and
 `awww` transitions.
 
-> **Status:** under construction. The CLI/contract below is the target design; unchecked
-> roadmap items are not implemented yet. See [`ROADMAP.md`](ROADMAP.md).
+> **Status:** picker, metadata library, thumbnail service, and headless commands implemented.
+> Automated tests pass; live desktop acceptance checks remain in [`ROADMAP.md`](ROADMAP.md).
+> Installation and Hyprland wiring are user-applied.
 
 ---
 
@@ -19,7 +20,7 @@ It replaces the rofi + bash gallery with real categories, favorites, folder sour
 - Single click selects, double click applies; full keyboard navigation.
 - Random wallpaper from the last category used in the GUI, via a global keybind.
 - `awww` transitions with a `swaybg` fallback.
-- Disk thumbnail cache, progressive loading, no full-size decoding in the UI.
+- Disk thumbnail cache, visible-row priority, progressive loading, no full-size decoding in the UI.
 
 ---
 
@@ -28,11 +29,16 @@ It replaces the rofi + bash gallery with real categories, favorites, folder sour
 ### From source
 
 ```bash
-git clone <repo-url> wallpicker   # or use the existing folder
-cd wallpicker
+# From this repository directory:
 cargo build --release
+./target/release/wallpicker
+
+# Optional installation after trying the picker:
 install -Dm755 target/release/wallpicker ~/.local/bin/wallpicker
 ```
+
+An optional launcher is supplied at `assets/wallpicker.desktop`. After installing the binary,
+copy it into your applications directory if desired; it is not installed automatically.
 
 Requirements at runtime:
 
@@ -55,12 +61,13 @@ wallpicker random                Random wallpaper from the last category used in
 wallpicker random --category favorites
 wallpicker random --category all
 wallpicker random --category "Dark"
-wallpicker random --no-rescan    Skip rescanning sources before choosing
+wallpicker random --no-rescan    Reuse stored lists where possible
 wallpicker set <path>            Apply one image
 wallpicker restore               Re-apply the last wallpaper (quiet; for login)
 wallpicker rescan                Scan sources and print a summary
 wallpicker --version
 wallpicker --help
+wallpicker --quiet set <path>    Apply without a desktop notification
 ```
 
 Examples:
@@ -84,11 +91,14 @@ wallpicker restore
 
 ### Behavior notes
 
+- On first run, `~/Pictures/wallpaper` is added as a recursive source if that directory exists.
+  Otherwise open Sources in the picker to add a directory.
 - The GUI is single-instance. Launching it again focuses the existing window.
 - `random` uses the last category selected in the picker. If that category is missing or
   empty it falls back to **All**. It avoids repeating the current wallpaper when possible.
 - `random` from Favorites or a manual category reads stored paths; `all` or a folder category
-  triggers a scan.
+  triggers a scan. `--no-rescan` also needs a scan for All/folders or an empty-category
+  fallback, because the scan pool is not persisted.
 - Applying a wallpaper writes the legacy state file used by the old bash script, so
   `restore` and old tooling keep working.
 - A successful apply closes the picker and sends one notification. Failure keeps the window
@@ -108,13 +118,21 @@ wallpicker restore
 | Arrows / `h` `j` `k` `l` | Move selection |
 | `Space` | Toggle favorite |
 | `R` | Random from the selected category |
-| `/` | Focus search |
+| `/` | Focus search; `Enter` selects the first result and returns to the gallery |
+| `Ctrl+P` | Search all actions, categories, and source settings |
+| Up / Down, then `Enter` in command palette | Choose and execute an action |
 | `Ctrl+A` / `Ctrl+D` | Select all / clear selection |
 | `F2` | Rename selected category |
 | `Esc` | Close dialog, then close the app |
 
 Right-click a tile for: Apply · Toggle favorite · Add to category · Remove from current
 category · Reveal in file manager · Copy path.
+
+Use `Ctrl+P` to create, rename, or delete categories, add/remove sources, change source
+options, hide/unhide folders, tag selections, sort, reveal/copy, or clean missing entries
+and orphaned thumbnails. Destructive actions open a confirmation: `Enter` confirms and
+`Esc` cancels. In the Add source dialog, `Ctrl+R` toggles recursion, `Ctrl+F` toggles folder
+categories, and `Ctrl+B` opens Browse; `Enter` submits the path.
 
 ---
 
@@ -129,7 +147,9 @@ category · Reveal in file manager · Copy path.
   names from different sources merge. They are read-only and can be hidden; they reappear
   after a rescan unless hidden.
 - **Sources** are directories to scan. Add as many as you like; enable recursion and
-  auto-folder categories per source.
+  auto-folder categories per source. Duplicate/nested sources are rejected. Supported
+  formats: PNG, JPEG, WebP, GIF, BMP, TIFF. Symlinks are not followed during scanning.
+  Turning recursion off preserves existing tags for when recursion is enabled again.
 - Removing a source asks for confirmation and removes that source's paths from All, folder
   categories, manual categories, and Favorites. Files on disk are untouched.
 - Manual categories can only contain images from sources. To include loose images, add
@@ -213,7 +233,10 @@ hyprctl clients | grep -A2 -i wallpicker
 
 ## Configuration
 
-`~/.config/wallpicker/config.toml` is created with defaults on first run.
+`~/.config/wallpicker/config.toml` is created with defaults on first run. Invalid TOML or
+out-of-range values use defaults for that run and leave the original config intact; the
+reason is written to the log. Colors use `#RRGGBB`, window percentages are 1–100, thumbnail
+workers are 1–32, and transition duration is 0–60 seconds.
 
 ```toml
 [behavior]
@@ -256,8 +279,13 @@ double click applies.
 | `~/.cache/wallpicker/wallpicker.log` | Diagnostics |
 | `~/.local/state/dotfiles/wallpaper/current` | Last applied wallpaper (legacy-compatible) |
 
-`library.json` is written atomically. If it is ever corrupt, wallpicker backs it up instead
-of overwriting it.
+The config, library, cache, and state locations honor absolute `XDG_CONFIG_HOME`,
+`XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` overrides respectively.
+
+`library.json` is written atomically with mode `0600`. If it is corrupt, wallpicker
+creates a timestamped `.corrupt-*.bak` beside it and stops with an error, preserving
+the original. Restore a known-good backup or explicitly rename the original before
+starting a fresh library. Unknown future library versions are refused without rewriting.
 
 ---
 
@@ -265,7 +293,7 @@ of overwriting it.
 
 1. If `awww` is available, use namespace `dotfiles` with the configured transition.
    Start `awww-daemon` detached if it is not running.
-2. Otherwise spawn `swaybg -i <image> -m fill` and track its PID so the previous instance is
+2. If the client/daemon is missing or applying through `awww` fails, spawn `swaybg -i <image> -m fill` and track its PID so the previous instance is
    replaced cleanly.
 3. Atomically write the current wallpaper path to the legacy state file.
 4. Send a desktop notification (unless disabled).
@@ -273,6 +301,12 @@ of overwriting it.
 ---
 
 ## Building and testing
+
+Dependencies are optimized in development builds as well, so `cargo run` can decode and
+resize large wallpapers quickly. The first dependency build takes longer; your own Rust
+code remains debuggable. Previews are generated for visible rows with a small overscan,
+and obsolete queued requests are skipped when you scroll or change categories. The
+footer shows preview readiness; your existing cached thumbnails are reused.
 
 ```bash
 cargo check
@@ -285,6 +319,22 @@ cargo build --release
 ```
 
 Tests never use real wallpaper files; they generate small images in temporary directories.
+`--help` and `--version` do not initialize app data. To try a scan without creating files
+in your normal XDG directories, run this from the repository:
+
+```bash
+mkdir -p .cache/smoke/{config,data,cache,state}
+XDG_CONFIG_HOME="$PWD/.cache/smoke/config" \
+XDG_DATA_HOME="$PWD/.cache/smoke/data" \
+XDG_CACHE_HOME="$PWD/.cache/smoke/cache" \
+XDG_STATE_HOME="$PWD/.cache/smoke/state" \
+  cargo run -- rescan
+```
+
+This still reads `~/Pictures/wallpaper` as the default source if it exists. It does not
+apply a wallpaper. Applying `set`, `random`, or `restore` changes the live desktop even
+with isolated data paths. Desktop acceptance checks (real apply/restore, monitor scaling,
+scrolling, and Hyprland wiring) require an interactive session; unit tests do not replace them.
 
 ---
 
