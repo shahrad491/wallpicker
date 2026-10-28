@@ -9,7 +9,7 @@ use std::{
     sync::Mutex,
 };
 use wallpicker::{
-    cli::{Cli, Command},
+    cli::{Cli, Command, LiveCommand},
     config::Config,
     model::{Library, Source, scan},
     paths::Paths,
@@ -45,7 +45,14 @@ fn logging(paths: &Paths) -> Result<()> {
     let file = OpenOptions::new().create(true).append(true).open(logpath)?;
     let logger = Box::leak(Box::new(FileLogger(Mutex::new(file))));
     let _ = log::set_logger(logger);
-    log::set_max_level(log::LevelFilter::Info);
+    // wgpu enumerates every adapter for its INFO log. Keep that optional: on
+    // hybrid systems it can initialize an otherwise unused graphics driver.
+    let verbose = std::env::var("WALLPICKER_LOG").is_ok_and(|value| value == "info");
+    log::set_max_level(if verbose {
+        log::LevelFilter::Info
+    } else {
+        log::LevelFilter::Warn
+    });
     std::panic::set_hook(Box::new(|info| {
         log::error!("panic: {info}");
         eprintln!("wallpicker: {info}");
@@ -83,6 +90,9 @@ fn instance_lock(cache: &Path) -> Result<Option<File>> {
 }
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, None | Some(Command::Pick)) {
+        wallpicker::startup::prepare_gui_environment()?;
+    }
     let paths = Paths::discover()?;
     logging(&paths)?;
     let mut config = Config::load(&paths.config)?;
@@ -92,7 +102,9 @@ fn run() -> Result<()> {
     if cli.quiet {
         config.behavior.notify = false;
     }
+    wallpicker::startup::checkpoint("configuration loaded");
     let library = load_library(&paths)?;
+    wallpicker::startup::checkpoint("library loaded");
     if !paths.library.exists() {
         library.save(&paths.library)?;
     }
@@ -118,6 +130,31 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Command::Live {
+            command: LiveCommand::Stop,
+        } => backend.stop_live(),
+        Command::Rotate {
+            interval,
+            category,
+            include_live,
+            once,
+        } => {
+            let options = wallpicker::rotation::Options {
+                interval,
+                category,
+                include_live,
+                quiet: cli.quiet,
+            };
+            if once {
+                println!(
+                    "{}",
+                    wallpicker::rotation::change_once(&paths, &options)?.display()
+                );
+                Ok(())
+            } else {
+                wallpicker::rotation::run(&paths, &options)
+            }
+        }
         Command::Set { path } => backend.apply(&path),
         Command::Restore => backend.restore(),
         Command::Random {
@@ -134,6 +171,7 @@ fn run() -> Result<()> {
     }
 }
 fn main() {
+    wallpicker::startup::start();
     if let Err(error) = run().context("wallpicker failed") {
         log::error!("{error:#}");
         eprintln!("{error:#}");

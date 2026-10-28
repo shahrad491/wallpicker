@@ -56,7 +56,8 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
             let selected = app.selected.contains(path);
             let hovered = app.hovered.as_ref() == Some(path);
             let favorite = app.library.favorites.contains(path);
-            let preview: Element<'_, Message> = if let Some(cached) = app.thumbnails.get(path) {
+            let preview_image: Element<'_, Message> = if let Some(cached) = app.thumbnails.get(path)
+            {
                 image(cached.clone())
                     .width(Length::Fill)
                     .height(preview_height)
@@ -74,6 +75,25 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
                 .center_x(Length::Fill)
                 .center_y(preview_height)
                 .into()
+            };
+            let badge = match crate::media::kind(path) {
+                crate::media::MediaKind::Image => None,
+                crate::media::MediaKind::Video => Some("▶ Video"),
+                crate::media::MediaKind::WallpaperEngine => Some("◆ Wallpaper Engine"),
+            };
+            let preview: Element<'_, Message> = if let Some(badge) = badge {
+                iced::widget::stack![
+                    preview_image,
+                    container(
+                        container(text(badge).size(11))
+                            .padding([3, 6])
+                            .style(crate::theme::panel)
+                    )
+                    .padding(5)
+                ]
+                .into()
+            } else {
+                preview_image
             };
             let mut actions = row![
                 text(if Some(path) == app.current.as_ref() {
@@ -108,14 +128,17 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
                             .on_press(Message::Context(path.clone())),
                     );
             }
-            let caption = path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy();
+            let caption = app
+                .scan
+                .pool
+                .iter()
+                .find(|entry| &entry.path == path)
+                .and_then(|entry| entry.title.clone())
+                .unwrap_or_else(|| crate::media::display_name(path));
             let caption = if caption.chars().count() > 27 {
                 format!("{}…", caption.chars().take(26).collect::<String>())
             } else {
-                caption.into_owned()
+                caption
             };
             let tile = container(column![preview, text(caption).size(12), actions].spacing(4))
                 .padding(8)

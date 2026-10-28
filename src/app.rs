@@ -1,10 +1,11 @@
 //! Iced picker with asynchronous scanning, thumbnails, apply, and serialized saves.
 use crate::{
     config::Config,
-    message::Message,
+    message::{ApplyIntent, Message, RotationServiceAction, SettingsToggle},
     model::{CategoryRef, Library, ScanResult, Source, scan},
     paths::Paths,
     thumbs::Thumbnailer,
+    ui::settings::SettingsDraft,
     wallpaper::Backend,
 };
 use iced::{
@@ -41,6 +42,7 @@ impl std::fmt::Display for Sort {
 }
 #[derive(Debug, Clone)]
 pub enum Dialog {
+    Settings,
     Commands,
     NewCategory,
     Rename(u64),
@@ -58,6 +60,11 @@ pub enum Dialog {
 pub(crate) struct App {
     pub paths: Paths,
     pub config: Config,
+    pub settings: SettingsDraft,
+    pub config_saving: bool,
+    pub config_save_again: bool,
+    pub service_busy: bool,
+    pub service_status: String,
     pub library: Library,
     pub scan: ScanResult,
     pub visible: Vec<PathBuf>,
@@ -95,6 +102,7 @@ pub(crate) struct App {
 pub fn run(paths: Paths, config: Config, library: Library) -> anyhow::Result<()> {
     let size = monitor_size(&config);
     let thumbs = Thumbnailer::new(paths.cache.join("thumbs"), config.thumbs.clone())?;
+    crate::startup::checkpoint("GUI preparation complete");
     iced::application(
         move || {
             App::new(
@@ -167,9 +175,15 @@ impl App {
     ) -> (Self, Task<Message>) {
         let category = library.last_category.clone();
         let current = Backend::new(paths.clone(), config.clone()).current();
+        let settings = SettingsDraft::from_config(&config);
         let mut app = Self {
             paths,
             config,
+            settings,
+            config_saving: false,
+            config_save_again: false,
+            service_busy: false,
+            service_status: "Not checked".into(),
             library,
             scan: ScanResult::default(),
             visible: vec![],
@@ -208,9 +222,17 @@ impl App {
         (app, task)
     }
     fn subscription(&self) -> Subscription<Message> {
+        // listen_with intentionally excludes redraws. Subscribe to the raw
+        // window-frame stream only until the first frame has been recorded.
+        let first_frame = if crate::startup::first_redraw_pending() {
+            iced::window::frames().map(|_| Message::FirstRedraw)
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
+            first_frame,
             iced::event::listen_with(|event, status, _| {
-                let global = matches!(&event,iced::Event::Keyboard(keyboard::Event::KeyPressed{key,modifiers,..}) if modifiers.control() || matches!(key,keyboard::Key::Named(Named::Escape|Named::ArrowUp|Named::ArrowDown)));
+                let global = matches!(&event,iced::Event::Keyboard(keyboard::Event::KeyPressed{key,modifiers,..}) if modifiers.control() || matches!(key,keyboard::Key::Named(Named::Escape|Named::ArrowUp|Named::ArrowDown|Named::Tab)));
                 if global
                     || matches!(
                         &event,
@@ -248,6 +270,26 @@ impl App {
             async move { library.save(&path).map_err(|e| e.to_string()) },
             Message::Saved,
         )
+    }
+    fn save_config(&mut self) -> Task<Message> {
+        if self.config_saving {
+            self.config_save_again = true;
+            return Task::none();
+        }
+        self.config_saving = true;
+        let config = self.config.clone();
+        let path = self.paths.config.clone();
+        Task::perform(
+            async move { config.save(&path).map_err(|error| error.to_string()) },
+            Message::ConfigSaved,
+        )
+    }
+    fn close_after_saves(&self) -> Task<Message> {
+        if self.close_requested && !self.saving && !self.config_saving && self.error.is_none() {
+            iced::exit()
+        } else {
+            Task::none()
+        }
     }
     pub(crate) fn title(&self) -> String {
         match &self.category {
@@ -288,16 +330,23 @@ impl App {
             .iter()
             .filter(|e| {
                 paths.contains(&e.path)
-                    && e.path
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().to_lowercase().contains(&query))
+                    && e.title
+                        .clone()
+                        .unwrap_or_else(|| crate::media::display_name(&e.path))
+                        .to_lowercase()
+                        .contains(&query)
             })
             .collect();
         entries.sort_by(|a, b| match self.sort {
             Sort::Name => a
-                .path
-                .file_name()
-                .cmp(&b.path.file_name())
+                .title
+                .clone()
+                .unwrap_or_else(|| crate::media::display_name(&a.path))
+                .cmp(
+                    &b.title
+                        .clone()
+                        .unwrap_or_else(|| crate::media::display_name(&b.path)),
+                )
                 .then(a.path.cmp(&b.path)),
             Sort::Newest => b.mtime.cmp(&a.mtime).then(a.path.cmp(&b.path)),
             Sort::Oldest => a.mtime.cmp(&b.mtime).then(a.path.cmp(&b.path)),
@@ -391,16 +440,25 @@ impl App {
             }
         )
     }
-    fn apply(&mut self, path: PathBuf) -> Task<Message> {
+    fn apply(&mut self, path: PathBuf, intent: ApplyIntent) -> Task<Message> {
         if self.applying {
             return Task::none();
         }
         self.applying = true;
+        self.error = None;
+        if intent == ApplyIntent::KeepBrowsing {
+            self.dialog = None;
+        }
         self.status = "Applying wallpaper…".into();
         let backend = Backend::new(self.paths.clone(), self.config.clone());
+        let applied_path = path.clone();
         Task::perform(
             async move { backend.apply(&path).map_err(|e| e.to_string()) },
-            Message::Applied,
+            move |result| Message::Applied {
+                path: applied_path.clone(),
+                intent,
+                result,
+            },
         )
     }
     fn choose(&mut self, path: PathBuf) {
@@ -429,6 +487,10 @@ impl App {
     }
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::FirstRedraw => {
+                crate::startup::first_redraw();
+                Task::none()
+            }
             Message::ActivateCommand => {
                 let commands = self.commands();
                 if let Some((_, action)) = commands.get(self.command_index) {
@@ -518,6 +580,40 @@ impl App {
                                         return self.update(Message::ActivateCommand);
                                     }
                                     _ => {}
+                                }
+                            } else if matches!(dialog, Dialog::Settings) {
+                                if modifiers.control() {
+                                    match key.as_ref() {
+                                        keyboard::Key::Character("s") => {
+                                            return self.update(Message::Confirm);
+                                        }
+                                        keyboard::Key::Character("l") => {
+                                            return self.update(Message::SettingsToggle(
+                                                SettingsToggle::IncludeLive,
+                                                !self.settings.include_live,
+                                            ));
+                                        }
+                                        keyboard::Key::Character("n") => {
+                                            return self.update(Message::SettingsToggle(
+                                                SettingsToggle::Notify,
+                                                !self.settings.notify,
+                                            ));
+                                        }
+                                        keyboard::Key::Character("m") => {
+                                            return self.update(Message::SettingsToggle(
+                                                SettingsToggle::Muted,
+                                                !self.settings.muted,
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if key == keyboard::Key::Named(Named::Tab) {
+                                    return if modifiers.shift() {
+                                        widget::operation::focus_previous()
+                                    } else {
+                                        widget::operation::focus_next()
+                                    };
                                 }
                             } else if matches!(dialog, Dialog::AddSource) && modifiers.control() {
                                 match key.as_ref() {
@@ -678,22 +774,34 @@ impl App {
                 self.choose(path);
                 Task::none()
             }
-            Message::Apply(path) => self.apply(path),
+            Message::Apply(path) => self.apply(path, ApplyIntent::ClosePicker),
+            Message::ApplyPreview(path) => self.apply(path, ApplyIntent::KeepBrowsing),
             Message::ApplySelected => {
                 if let Some(path) = self
                     .active
                     .clone()
                     .or_else(|| self.selected.first().cloned())
                 {
-                    self.apply(path)
+                    self.apply(path, ApplyIntent::ClosePicker)
                 } else {
                     Task::none()
                 }
             }
-            Message::Applied(result) => {
+            Message::Applied {
+                path,
+                intent,
+                result,
+            } => {
                 self.applying = false;
                 match result {
-                    Ok(()) => self.update(Message::Close),
+                    Ok(()) => {
+                        self.status = format!("Wallpaper applied: {}", path.display());
+                        self.current = Some(path);
+                        match intent {
+                            ApplyIntent::ClosePicker => self.update(Message::Close),
+                            ApplyIntent::KeepBrowsing => Task::none(),
+                        }
+                    }
                     Err(e) => {
                         self.error = Some(e);
                         self.status = "Apply failed".into();
@@ -743,7 +851,7 @@ impl App {
                     .cloned()
                     .collect();
                 if let Some(path) = choices.choose(&mut rand::rng()) {
-                    self.apply(path.clone())
+                    self.apply(path.clone(), ApplyIntent::ClosePicker)
                 } else {
                     self.error =
                         Some("This category has no wallpapers. Select All or add a source.".into());
@@ -781,11 +889,14 @@ impl App {
                     },
                     |r| match r {
                         Ok(()) => Message::Noop,
-                        Err(e) => Message::Applied(Err(e)),
+                        Err(e) => Message::OperationFailed(e),
                     },
                 )
             }
             Message::OpenDialog(dialog) => {
+                if matches!(dialog, Dialog::Settings) {
+                    self.settings = SettingsDraft::from_config(&self.config);
+                }
                 self.dialog_text = match &dialog {
                     Dialog::Rename(id) => self
                         .library
@@ -797,9 +908,14 @@ impl App {
                     _ => String::new(),
                 };
                 self.command_index = 0;
+                let settings = matches!(dialog, Dialog::Settings);
                 self.dialog = Some(dialog);
                 self.error = None;
-                widget::operation::focus("dialog-input")
+                widget::operation::focus(if settings {
+                    "settings-interval"
+                } else {
+                    "dialog-input"
+                })
             }
             Message::DialogText(value) => {
                 self.dialog_text = value;
@@ -895,14 +1011,69 @@ impl App {
                 if self.save_again {
                     self.save_again = false;
                     self.save()
-                } else if self.close_requested && self.error.is_none() {
-                    iced::exit()
                 } else {
-                    Task::none()
+                    self.close_after_saves()
                 }
+            }
+            Message::SettingsText(field, value) => {
+                self.settings.edit(field, value);
+                Task::none()
+            }
+            Message::SettingsToggle(field, value) => {
+                self.settings.toggle(field, value);
+                Task::none()
+            }
+            Message::ConfigSaved(result) => {
+                self.config_saving = false;
+                match result {
+                    Ok(()) => {
+                        self.status =
+                            "Settings saved. Start or restart rotation to use them.".into()
+                    }
+                    Err(error) => self.error = Some(format!("Could not save settings: {error}")),
+                }
+                if self.config_save_again {
+                    self.config_save_again = false;
+                    self.save_config()
+                } else {
+                    self.close_after_saves()
+                }
+            }
+            Message::RotationService(action) => {
+                if self.service_busy
+                    || (action == RotationServiceAction::Start && self.config_saving)
+                {
+                    return Task::none();
+                }
+                self.service_busy = true;
+                self.error = None;
+                Task::perform(
+                    async move { crate::ui::settings::run_service(action) },
+                    move |result| Message::RotationServiceFinished { action, result },
+                )
+            }
+            Message::RotationServiceFinished { action, result } => {
+                self.service_busy = false;
+                match result {
+                    Ok(status) => {
+                        self.service_status = status;
+                        if action != RotationServiceAction::Refresh {
+                            self.status = format!("Wallpaper rotation: {}", self.service_status);
+                        }
+                    }
+                    Err(error) => {
+                        self.service_status = "Unavailable".into();
+                        self.error = Some(error);
+                    }
+                }
+                Task::none()
             }
             Message::DismissError => {
                 self.error = None;
+                Task::none()
+            }
+            Message::OperationFailed(error) => {
+                self.error = Some(error);
                 Task::none()
             }
             Message::Scroll(y) => {
@@ -927,7 +1098,7 @@ impl App {
                 Task::none()
             }
             Message::Close => {
-                if self.saving {
+                if self.saving || self.config_saving {
                     self.close_requested = true;
                     self.status = "Saving changes…".into();
                     Task::none()
@@ -940,6 +1111,22 @@ impl App {
     }
     pub(crate) fn commands(&self) -> Vec<(String, Message)> {
         let mut commands = vec![
+            (
+                "Playback and rotation settings".into(),
+                Message::OpenDialog(Dialog::Settings),
+            ),
+            (
+                "Start or restart automatic wallpaper rotation".into(),
+                Message::RotationService(RotationServiceAction::Start),
+            ),
+            (
+                "Stop automatic wallpaper rotation".into(),
+                Message::RotationService(RotationServiceAction::Stop),
+            ),
+            (
+                "Refresh wallpaper rotation service status".into(),
+                Message::RotationService(RotationServiceAction::Refresh),
+            ),
             (
                 "Show All wallpapers".into(),
                 Message::Category(CategoryRef::All),
@@ -1051,6 +1238,10 @@ impl App {
                 Message::Apply(path.clone()),
             ));
             commands.push((
+                "Test selected wallpaper (keep open)".into(),
+                Message::ApplyPreview(path.clone()),
+            ));
+            commands.push((
                 "Reveal selected wallpaper".into(),
                 Message::Reveal(path.clone()),
             ));
@@ -1066,6 +1257,21 @@ impl App {
         let Some(dialog) = self.dialog.clone() else {
             return Task::none();
         };
+        if matches!(dialog, Dialog::Settings) {
+            return match self.settings.apply_to(&self.config) {
+                Ok(config) => {
+                    self.config = config;
+                    self.settings = SettingsDraft::from_config(&self.config);
+                    self.error = None;
+                    self.status = "Saving playback and rotation settings…".into();
+                    self.save_config()
+                }
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    Task::none()
+                }
+            };
+        }
         if matches!(dialog, Dialog::CleanupCache) {
             self.dialog = None;
             return self.update(Message::DoCleanCache);
@@ -1378,10 +1584,83 @@ mod tests {
         assert!(app.close_requested);
         app.close_requested = false;
         app.applying = true;
-        let _ = app.update(Message::Applied(Err("test backend failure".into())));
+        let _ = app.update(Message::Applied {
+            path: PathBuf::from("/fixture/wallpaper.png"),
+            intent: ApplyIntent::ClosePicker,
+            result: Err("test backend failure".into()),
+        });
         assert!(!app.applying);
         assert!(!app.close_requested);
         assert_eq!(app.error.as_deref(), Some("test backend failure"));
+    }
+    #[test]
+    fn context_apply_keeps_browsing_and_reports_the_applied_path() {
+        let (_temp, mut app) = fixture();
+        let applied_path = PathBuf::from("/fixture/preview.png");
+        app.dialog = Some(Dialog::Context(applied_path.clone()));
+        app.error = Some("previous error".into());
+        app.saving = true;
+        let _ = app.update(Message::ApplyPreview(applied_path.clone()));
+        assert!(app.applying);
+        assert!(app.dialog.is_none(), "accepted preview closes the menu");
+        assert!(app.error.is_none());
+
+        // Moving selection and trying another apply cannot change the first
+        // invocation's path or its request to keep the picker open.
+        let other_path = PathBuf::from("/fixture/other.png");
+        app.active = Some(other_path.clone());
+        let _ = app.update(Message::Apply(other_path));
+        assert!(app.applying);
+        let _ = app.update(Message::Applied {
+            path: applied_path.clone(),
+            intent: ApplyIntent::KeepBrowsing,
+            result: Ok(()),
+        });
+        assert!(!app.applying);
+        assert!(!app.close_requested, "preview must not request an exit");
+        assert_eq!(app.current, Some(applied_path.clone()));
+        assert_eq!(
+            app.status,
+            format!("Wallpaper applied: {}", applied_path.display())
+        );
+    }
+    #[test]
+    fn ordinary_apply_still_closes_after_pending_save() {
+        let (_temp, mut app) = fixture();
+        let path = PathBuf::from("/fixture/chosen.png");
+        app.saving = true;
+        let _ = app.update(Message::Apply(path.clone()));
+        assert!(app.applying);
+        let _ = app.update(Message::Applied {
+            path: path.clone(),
+            intent: ApplyIntent::ClosePicker,
+            result: Ok(()),
+        });
+        assert!(!app.applying);
+        assert!(
+            app.close_requested,
+            "ordinary apply retains close-after-save"
+        );
+        assert_eq!(app.current, Some(path));
+    }
+    #[test]
+    fn apply_failure_preserves_current_wallpaper_in_both_flows() {
+        for intent in [ApplyIntent::ClosePicker, ApplyIntent::KeepBrowsing] {
+            let (_temp, mut app) = fixture();
+            let previous = PathBuf::from("/fixture/previous.png");
+            app.current = Some(previous.clone());
+            let _ = app.apply(PathBuf::from("/fixture/failed.png"), intent);
+            let _ = app.update(Message::Applied {
+                path: PathBuf::from("/fixture/failed.png"),
+                intent,
+                result: Err("backend unavailable".into()),
+            });
+            assert!(!app.applying);
+            assert!(!app.close_requested);
+            assert_eq!(app.current, Some(previous));
+            assert_eq!(app.error.as_deref(), Some("backend unavailable"));
+            assert_eq!(app.status, "Apply failed");
+        }
     }
     #[test]
     fn command_palette_exposes_management_without_favorites_deletion() {
@@ -1520,5 +1799,83 @@ mod tests {
             0..1,
             "shrinking a category must clamp stale scroll offsets"
         );
+    }
+    #[test]
+    fn settings_validation_does_not_change_live_config_on_error() {
+        let (_temp, mut app) = fixture();
+        let original = app.config.rotation.interval.clone();
+        let _ = app.update(Message::OpenDialog(Dialog::Settings));
+        app.settings.interval = "0s".into();
+        let task = app.update(Message::Confirm);
+        assert_eq!(task.units(), 0);
+        assert!(!app.config_saving);
+        assert_eq!(app.config.rotation.interval, original);
+        assert!(app.error.is_some());
+        assert!(matches!(app.dialog, Some(Dialog::Settings)));
+    }
+    #[test]
+    fn config_and_library_saves_queue_independently_and_close_waits_for_both() {
+        let (_temp, mut app) = fixture();
+        app.saving = true;
+        let _ = app.update(Message::OpenDialog(Dialog::Settings));
+        app.settings.interval = "10m".into();
+        assert_eq!(app.update(Message::Confirm).units(), 1);
+        assert!(app.config_saving);
+        assert!(app.saving, "config save must not alter library save state");
+        app.settings.interval = "45m".into();
+        assert_eq!(app.update(Message::Confirm).units(), 0);
+        assert!(app.config_save_again);
+        assert_eq!(app.config.rotation.interval, "45m");
+        assert_eq!(app.update(Message::Close).units(), 0);
+        assert!(app.close_requested);
+        assert_eq!(
+            app.update(Message::Saved(Ok(()))).units(),
+            0,
+            "must wait for config queue after library finishes"
+        );
+        assert!(!app.saving);
+        assert_eq!(
+            app.update(Message::ConfigSaved(Ok(()))).units(),
+            1,
+            "write the latest config snapshot next"
+        );
+        assert!(app.config_saving);
+        assert!(!app.config_save_again);
+        assert_eq!(app.config.rotation.interval, "45m");
+        assert_eq!(
+            app.update(Message::ConfigSaved(Ok(()))).units(),
+            1,
+            "exit only after the final config write"
+        );
+        assert!(!app.config_saving);
+    }
+    #[test]
+    fn failed_config_save_keeps_picker_open_and_displays_error() {
+        let (_temp, mut app) = fixture();
+        app.config_saving = true;
+        app.close_requested = true;
+        let task = app.update(Message::ConfigSaved(Err("read-only filesystem".into())));
+        assert_eq!(task.units(), 0);
+        assert!(!app.config_saving);
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("read-only filesystem")
+        );
+    }
+    #[test]
+    fn service_errors_are_visible_without_changing_apply_state() {
+        let (_temp, mut app) = fixture();
+        app.service_busy = true;
+        app.applying = true;
+        let task = app.update(Message::RotationServiceFinished {
+            action: RotationServiceAction::Start,
+            result: Err("service missing".into()),
+        });
+        assert_eq!(task.units(), 0);
+        assert!(!app.service_busy);
+        assert!(app.applying);
+        assert_eq!(app.error.as_deref(), Some("service missing"));
     }
 }

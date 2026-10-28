@@ -118,6 +118,11 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
             button("Clean missing entries")
                 .on_press(Message::OpenDialog(Dialog::Cleanup))
                 .style(button::text),
+        )
+        .push(
+            button("Playback & rotation settings")
+                .on_press(Message::OpenDialog(Dialog::Settings))
+                .style(button::text),
         );
     container(scrollable(items).height(Length::Fill))
         .padding(20)

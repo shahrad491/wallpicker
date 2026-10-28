@@ -15,6 +15,12 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
     let mut body = column![].spacing(14);
     let mut confirm = Some("Save");
     match dialog {
+        Dialog::Settings => {
+            body = body
+                .push(text("Playback & rotation settings").size(23))
+                .push(crate::ui::settings::view(app));
+            confirm = Some("Save settings");
+        }
         Dialog::Commands => {
             confirm = None;
             body = body
@@ -207,9 +213,11 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
                     .size(18),
                 )
                 .push(
-                    button("Apply wallpaper")
+                    button("Apply wallpaper (keep open)")
                         .width(Length::Fill)
-                        .on_press(Message::Apply(path.clone())),
+                        .on_press_maybe(
+                            (!app.applying).then_some(Message::ApplyPreview(path.clone())),
+                        ),
                 )
                 .push(
                     button("Toggle favorite")
@@ -252,7 +260,14 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
     }
     let mut footer = row![
         Space::new().width(Length::Fill),
-        button(if confirm.is_some() { "Cancel" } else { "Done" }).on_press(Message::Cancel)
+        button(if matches!(dialog, Dialog::Settings) {
+            "Close"
+        } else if confirm.is_some() {
+            "Cancel"
+        } else {
+            "Done"
+        })
+        .on_press(Message::Cancel)
     ]
     .spacing(10);
     if let Some(label) = confirm {
@@ -267,8 +282,11 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
     };
     let panel = container(content)
         .max_height((app.height - 16.0).max(100.0))
+        .max_width((app.width - 32.0).max(280.0))
         .padding(24)
-        .width(if matches!(dialog, Dialog::Context(_)) {
+        .width(if matches!(dialog, Dialog::Settings) {
+            730
+        } else if matches!(dialog, Dialog::Context(_)) {
             320
         } else {
             570

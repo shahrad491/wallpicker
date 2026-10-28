@@ -8,6 +8,26 @@ It replaces the rofi + bash gallery with real categories, favorites, folder sour
 > Automated tests pass; live desktop acceptance checks remain in [`ROADMAP.md`](ROADMAP.md).
 > Installation and Hyprland wiring are user-applied.
 
+```sh
+make build
+./target/release/wallpicker
+```
+
+Build a ready-to-extract archive with `make package` (under `target/dist/`), or install
+for your user with `make install`. Extracted archives include a one-command `./install.sh`.
+`make package-deb` creates a host-native `.deb`; `make package-appimage` checks for
+optional packaging tools. For Debian/Ubuntu distribution, an opt-in
+[Bookworm container recipe](docs/packaging.md#opt-in-debian-container-build) exports packages
+without linking against this host's GLIBC 2.44; the recipe has not been built here.
+See [package-format choices and compatibility](docs/packaging.md). See [installation](docs/installation.md) for archive
+layout, runtime requirements, and staging with `DESTDIR`.
+
+[User guide](docs/usage.md) · [Configuration](docs/configuration.md) ·
+[Live wallpapers](docs/live-wallpapers.md) · [Background rotation](docs/rotation.md) ·
+[Hyprland setup](docs/hyprland.md) · [Troubleshooting](docs/troubleshooting.md) ·
+[Development](docs/development.md) ·
+[All documentation](docs/README.md)
+
 ---
 
 ## Features
@@ -20,6 +40,8 @@ It replaces the rofi + bash gallery with real categories, favorites, folder sour
 - Single click selects, double click applies; full keyboard navigation.
 - Random wallpaper from the last category used in the GUI, via a global keybind.
 - `awww` transitions with a `swaybg` fallback.
+- Optional video (`mpvpaper`) and Wallpaper Engine (`linux-wallpaperengine`) backends.
+- Opt-in background rotation (30 minutes by default), with an inactive user service.
 - Disk thumbnail cache, visible-row priority, progressive loading, no full-size decoding in the UI.
 
 ---
@@ -30,15 +52,27 @@ It replaces the rofi + bash gallery with real categories, favorites, folder sour
 
 ```bash
 # From this repository directory:
-cargo build --release
+make build                       # cargo build --release --locked
 ./target/release/wallpicker
 
-# Optional installation after trying the picker:
-install -Dm755 target/release/wallpicker ~/.local/bin/wallpicker
+# Create a native Linux archive with launcher, docs, and SHA-256 checksum:
+make package
+
+# Optional installation after trying the picker (binary, launcher, docs):
+make install                     # defaults to PREFIX="$HOME/.local"
+
+# Or stage a system-style installation entirely inside the repository:
+make install PREFIX=/usr DESTDIR="$PWD/target/stage"
 ```
 
 An optional launcher is supplied at `assets/wallpicker.desktop`. After installing the binary,
-copy it into your applications directory if desired; it is not installed automatically.
+copy it into your applications directory if installing the binary manually. `make install`
+installs it with an SVG icon and inactive rotation user service, making timestamped
+backups before replacement. The installed launcher uses an absolute executable path,
+so it works even when your shell PATH has not been updated. Ensure `~/.local/bin` is in your session's `PATH`.
+
+Release archives are native Linux builds for the host architecture; system graphics
+libraries and wallpaper tools are not bundled. They are not universal static binaries.
 
 Requirements at runtime:
 
@@ -48,6 +82,7 @@ Requirements at runtime:
 | `swaybg` | fallback static wallpaper | optional |
 | `notify-send` | "Wallpaper changed" toast | optional |
 | `zenity` | native "Browse…" for source directories | optional |
+| `mpvpaper`, `ffmpeg`, `linux-wallpaperengine` | live/video/Wallpaper Engine backends | optional, separate installs |
 | `hyprctl` | monitor sizing + focusing an existing window | Hyprland |
 
 ---
@@ -65,6 +100,9 @@ wallpicker random --no-rescan    Reuse stored lists where possible
 wallpicker set <path>            Apply one image
 wallpicker restore               Re-apply the last wallpaper (quiet; for login)
 wallpicker rescan                Scan sources and print a summary
+wallpicker rotate                Optional background rotation (waits 30m by default)
+wallpicker rotate --once         Rotate immediately once
+wallpicker live stop             Stop app-owned live playback, keep restore state
 wallpicker --version
 wallpicker --help
 wallpicker --quiet set <path>    Apply without a desktop notification
@@ -99,10 +137,12 @@ wallpicker restore
 - `random` from Favorites or a manual category reads stored paths; `all` or a folder category
   triggers a scan. `--no-rescan` also needs a scan for All/folders or an empty-category
   fallback, because the scan pool is not persisted.
-- Applying a wallpaper writes the legacy state file used by the old bash script, so
-  `restore` and old tooling keep working.
-- A successful apply closes the picker and sends one notification. Failure keeps the window
-  open with an error.
+- Static wallpaper state remains compatible with the old bash script. For live paths,
+  use wallpicker restore; run `wallpicker live stop` before switching through the old
+  script, which cannot stop app-owned live players.
+- Double-click or `Enter` applies and closes after success. **Apply** in the tile
+  right-click/More menu keeps the picker open so you can try wallpapers. Applying sends
+  one notification unless disabled. Failure keeps the window open with an error.
 
 ---
 
@@ -111,8 +151,9 @@ wallpicker restore
 | Input | Action |
 |---|---|
 | Single click | Select image |
-| Double click | Apply image |
-| `Enter` | Apply selection |
+| Double click | Apply image and close on success |
+| `Enter` | Apply selection and close on success |
+| Right-click / More → Apply | Apply image and keep browsing |
 | `Ctrl` + click | Toggle selection |
 | `Shift` + click | Select range |
 | Arrows / `h` `j` `k` `l` | Move selection |
@@ -148,7 +189,8 @@ categories, and `Ctrl+B` opens Browse; `Enter` submits the path.
   after a rescan unless hidden.
 - **Sources** are directories to scan. Add as many as you like; enable recursion and
   auto-folder categories per source. Duplicate/nested sources are rejected. Supported
-  formats: PNG, JPEG, WebP, GIF, BMP, TIFF. Symlinks are not followed during scanning.
+  formats: PNG, JPEG, WebP, GIF, BMP, TIFF, supported videos, and Wallpaper Engine projects
+  (see [live wallpaper requirements](docs/live-wallpapers.md)). Symlinks are not followed during scanning.
   Turning recursion off preserves existing tags for when recursion is enabled again.
 - Removing a source asks for confirmation and removes that source's paths from All, folder
   categories, manual categories, and Favorites. Files on disk are untouched.
@@ -264,6 +306,8 @@ foreground = "#e4edef"
 muted = "#9bafb6"
 ```
 
+`behavior.close_on_select` is retained for config compatibility; action intent controls
+closing: double-click/Enter closes, context-menu Apply keeps browsing.
 `behavior.single_click_apply` is intentionally **not** configurable: single click selects,
 double click applies.
 
@@ -309,13 +353,11 @@ and obsolete queued requests are skipped when you scroll or change categories. T
 footer shows preview readiness; your existing cached thumbnails are reused.
 
 ```bash
-cargo check
-cargo test
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo run -- --help
-cargo run -- rescan
-cargo build --release
+make check                       # fmt, clippy -D warnings, tests
+make build                       # optimized, locked build
+make package-check               # archive smoke test using a fixture binary
+cargo run --locked -- --help
+cargo run --locked -- rescan
 ```
 
 Tests never use real wallpaper files; they generate small images in temporary directories.
@@ -339,6 +381,15 @@ scrolling, and Hyprland wiring) require an interactive session; unit tests do no
 ---
 
 ## Troubleshooting
+
+GUI startup defaults to Iced's software renderer to avoid cold GPU driver/shader
+initialization. Set `ICED_BACKEND=wgpu` for GPU rendering; that path prefers Vulkan and
+a low-power adapter unless you override it. Explicit renderer/WGPU settings are preserved. The native build disables
+Iced's `web-colors` and desktop-theme detection; cached JPEGs remain valid. Wide-gamut,
+HDR, and ICC color handling still have limits. Logs default to warnings plus startup
+timings; `WALLPICKER_LOG=info` enables verbose driver information and can slow probing.
+See [renderer and startup troubleshooting](docs/troubleshooting.md) for commands and
+measurement guidance.
 
 **Picker does not open / second launch does nothing**
 The app is single-instance; the existing window should be focused. Check the log at
@@ -369,6 +420,7 @@ Run `hyprctl clients` while the picker is open and confirm the class is `wallpic
 
 ## Project documents
 
+- [`docs/`](docs/README.md) — installation, packaging, user guide, config, Hyprland, development.
 - [`ROADMAP.md`](ROADMAP.md) — milestones, decisions, architecture, verification checklist.
 - [`AGENTS.md`](AGENTS.md) — rules and contracts for AI agents/contributors.
 

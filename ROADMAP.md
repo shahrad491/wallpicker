@@ -38,7 +38,7 @@ A fast, keyboard-friendly image picker with a real category system instead of a 
 | Source removal | Confirmation, then prune that source's paths from All, auto categories, manual categories, and Favorites. Files untouched |
 | Favorites | Pinned first; cannot be renamed or deleted; star toggle |
 | Random shortcut | Draws from the **last category selected in the GUI**; CLI can override |
-| After selection | Apply, close, show `notify-send` toast |
+| After selection | Double-click/Enter/toolbar/Random: apply, close, toast. More/right-click Apply: apply, keep browsing, toast (user update 2026-10-28) |
 | Click behavior | Single click selects; double click applies; `Enter` applies |
 | Hyprland wiring | Documented in `README.md` with copy-paste keybind/autostart snippets; dotfiles are not edited automatically |
 | Window | Borderless, centered, ~85% of focused monitor, dark catppuccin-ish theme |
@@ -298,7 +298,7 @@ Depends on M5.
 - [x] Keyboard: arrows/hjkl, Enter, Space, R, `/`, Ctrl+A, Ctrl+D, Esc
 - [x] Search filter + Name/Newest/Oldest sorting
 - [x] In-app random from current category, avoids repeat when possible
-- [x] Apply → close + toast; failure → stay open with error banner
+- [x] Ordinary apply → close + toast; context Apply → keep browsing + toast; failure → visible error
 - [x] Last category persisted on sidebar change
 
 **Implementation:** complete; real-desktop acceptance is tracked under M8.
@@ -349,6 +349,58 @@ Depends on M1/M5/M6.
   - add float/center/rounding window rules for class `wallpicker`
 
 **Done when:** you can use wallpicker daily and the old script is a fallback, not the default.
+
+---
+
+### M9 — Color, startup, preview apply, and distribution — @codex-core / @codex-ui / @codex-media / @codex-qa
+
+- [x] Diagnose washed-out previews against source/cached pixels; retain original cache colors
+- [x] Use native sRGB rendering; disable Iced web-colors float-surface path
+- [x] Default to software rendering to bypass cold GPU initialization; preserve explicit hardware overrides, remove portal theme query and verbose adapter enumeration
+- [x] Record startup checkpoints and first redraw for real-session timing
+- [x] More/right-click Apply keeps browsing; ordinary apply closes; successful previews refresh Current badge
+- [x] Add Makefile, native release archive/checksum, staging and installation scripts
+- [x] GitHub README and user/developer documentation under `docs/`
+- [x] 61 Rust tests, format, all-target Clippy, packaging fixture and staged-install backup checks
+- [x] Final native release archive validation: checksum, safe extraction, executable mode, docs, version/help/rescan
+- [x] User confirmed corrected preview colors
+- [ ] Repeat attended software-first cold-start/keep-open test in user's compositor session
+
+**User decision update (2026-10-28):** More/right-click Apply deliberately keeps the
+window open for testing wallpapers. This supersedes the original close-always rule for
+that action; normal double-click/Enter/toolbar/Random keep their closing behavior.
+
+**Renderer interface note:** no new CLI/config keys; GUI-only graphics defaults honor
+explicit environment overrides. Existing cache JPEGs remain valid; original wallpaper
+files are never modified. Packaging only creates artifacts under `target/`.
+
+---
+
+### M10 — Live media, rotation, and Linux installation — @codex-core / @codex-media / @codex-ui / @codex-qa
+
+- [x] Accept user's software renderer check; keep first-cold-start measurement pending
+- [x] Media contracts: image/video/project.json classification; canonical project manifests keep schema v1 paths
+- [x] Scanner background title/preview metadata; hide project internals as one gallery item
+- [x] Config contracts: [live] output/FPS/mute/assets, [rotation] interval/category/include_live/notify
+- [ ] mpvpaper videos and external linux-wallpaperengine projects with owned-process cleanup/restore
+- [ ] Background video/project previews and cache invalidation
+- [ ] Sleeping rotation CLI, configurable interval, category fallback, static-only default
+- [ ] GUI playback/rotation settings and explicit service controls
+- [x] User installer, absolute desktop launcher, icon and inactive systemd user unit
+- [x] Tar/standalone binary and .deb packaging; optional AppImage tooling; documented Flatpak constraints
+- [ ] Combined tests/fmt/Clippy, release, tar/.deb extraction and service/package syntax checks
+- [ ] Attended live backend/service check (optional playback tools not installed in this environment)
+
+**User scope update:** support both looping local videos and Wallpaper Engine projects.
+Video/project playback delegates to optional `mpvpaper`/`linux-wallpaperengine`; the app
+never installs them or claims complete upstream project compatibility. Existing image
+behavior and software-renderer startup remain. Automatic rotation waits the configured
+interval before the first change; enabling a service is a separate user action.
+
+**Shared API note:** `ImageEntry` now adds optional scanned `title` and `preview`
+(`PreviewMetadata {path, mtime, size}`), preventing project JSON reads in UI thumbnail
+lookups. This data is derived, not persisted. CLI adds `rotate` and `live stop`; README
+and docs describe all new settings/paths/installation controls in the same change.
 
 ---
 
@@ -444,3 +496,11 @@ Append one line per completed milestone/task group.
 | 2026-10-26 | M8 / release | Optimized binary built (28,675,496 bytes); isolated version/rescan smoke passed: 1,294 images, 4 folders, 0 skipped, 54 ms. Installation, compositor acceptance, and wiring intentionally pending. |
 | 2026-10-26 | M8 / user desktop test | User confirmed picker opens and applies wallpaper; reported click resetting scroll and most previews missing. Diagnosed Iced child-index state replacement and slow unoptimized full-collection thumbnail queue. Fixes: stable widget tree, viewport priority/cancellation, faster cover-crop area downsampling, optimized dev dependencies, readiness feedback; 54 tests, fmt, and all-target Clippy with warnings denied pass. |
 | 2026-10-26 | M8 / gallery fixes validated | 54 tests pass, including widget-tree preservation through selection/errors/dialogs, viewport bounds after category changes, crop correctness, and stale thumbnail cancellation. Fmt and all-target Clippy pass. Optimized-dependency sample: 1080p PNG thumbnail pipeline approximately 12.5–20.4 ms; existing cache reused. Repeat attended test requested via updated binary. |
+| 2026-10-28 | M9 / rendering and startup | Compared source and cached RGB values (approximately 1–2/255 differences); cache is not tinted. Disabled web-colors for native sRGB surfaces and removed theme-portal detection. GUI defaults prefer Vulkan/low-power GPU without overriding explicit environment choices; default log level skips INFO-only adapter enumeration. Startup checkpoints/first redraw retained for live timing. |
+| 2026-10-28 | M9 / interaction | User-requested More/right-click Apply now keeps browsing and refreshes Current; ordinary apply still closes. Async completions carry path/intent, failures preserve current wallpaper, concurrent requests guarded. Three new flow regressions. |
+| 2026-10-28 | M9 / distribution and docs | Added locked Make targets, native tar.gz+SHA-256 packaging, explicit installer with timestamped binary/launcher backups and DESTDIR support, root docs guides/troubleshooting and GitHub README. Packaging fixture and repeated staged installs verified inside target/. |
+| 2026-10-28 | M9 / automated QA | 61 Rust tests, fmt, all-target Clippy with warnings denied, shell syntax, package fixture/checksum, staged backup collision checks, and documentation links pass. Final release archive built and validated; actual first-cold-frame and native color appearance require user Wayland recheck. |
+| 2026-10-28 | M9 / package validated | make package completed; native Linux x86_64 archive and SHA-256 under target/dist/. Extracted payload passed version/help/isolated-rescan smoke; archive paths, executable permissions and docs verified. No user installation, Hyprland edit, or original wallpaper change performed. Live Wayland retest remains pending. |
+| 2026-10-28 | M9 / startup follow-up | User confirmed corrected colors, but Vulkan/iGPU first-open still about5s. Font initialization profiled23–28ms, first shaping under1ms. Software renderer clipped stress scene (40previews/70labels,1088×612 at1.5 scale): firstframe48–50ms, warm median15.5–16.4ms; no pathological scroll-mask lag observed. Switched default to tiny-skia, keeping GPU opt-in and explicit overrides. Live software-first launch still needs recheck. |
+| 2026-10-28 | M9 / software-first release | 61 tests, fmt and all-target Clippy pass after renderer policy update. Both software and GPU headless screenshots preserve gray128, gray64 and accent RGB exactly. Rebuilt final native archive and verified checksum, extraction and executable version. Software-first live startup/scrolling retest requested; old GPU5s report preserved above. |
+| 2026-10-28 | M10 / claimed | User accepts current startup pending cold check and requests easy Linux installation, both local video/Wallpaper Engine playback, configurable30m rotation, and distribution choices. Claimed core/media/UI/QA tracks; no automatic dependency installation or service activation. |

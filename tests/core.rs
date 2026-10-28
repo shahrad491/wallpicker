@@ -368,3 +368,79 @@ fn turning_recursion_off_preserves_existing_tags_for_later() -> Result<()> {
     library.save(&path)?;
     Ok(())
 }
+
+#[test]
+fn scan_treats_engine_project_as_one_wallpaper_with_background_preview_metadata() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let project = root.path().join("source/Dark/12345");
+    fs::create_dir_all(&project)?;
+    fs::write(
+        project.join("project.json"),
+        r#"{"type":"scene","title":"Night rain","preview":"custom.png"}"#,
+    )?;
+    image(&project.join("custom.png"))?;
+    image(&project.join("textures/asset.png"))?;
+    fs::write(root.path().join("source/clip.MP4"), b"fixture video")?;
+    let mut library = Library::default();
+    library.add_source(source(&root.path().join("source")))?;
+    let result = scan(&library.sources);
+    assert_eq!(result.pool.len(), 2);
+    let entry = result
+        .pool
+        .iter()
+        .find(|entry| entry.path.ends_with("project.json"))
+        .unwrap();
+    assert_eq!(entry.title.as_deref(), Some("Night rain"));
+    assert_eq!(
+        entry.preview.as_ref().unwrap().path,
+        project.join("custom.png").canonicalize()?
+    );
+    assert_eq!(
+        result.auto_categories["Dark"],
+        vec![project.join("project.json").canonicalize()?]
+    );
+    let id = library.add_category("Animated")?;
+    library.add_images(id, std::slice::from_ref(&entry.path))?;
+    library.toggle_favorite(&entry.path)?;
+    let store = root.path().join("library.json");
+    library.save(&store)?;
+    assert_eq!(Library::load(&store)?.favorites, vec![entry.path.clone()]);
+    Ok(())
+}
+#[test]
+fn nonrecursive_sources_do_not_import_nested_engine_projects_or_their_assets() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let nested = root.path().join("source/project");
+    fs::create_dir_all(&nested)?;
+    fs::write(nested.join("project.json"), r#"{"type":"scene"}"#)?;
+    image(&nested.join("preview.png"))?;
+    let mut entry = source(&root.path().join("source"));
+    entry.recursive = false;
+    assert!(scan(&[entry]).pool.is_empty());
+    let mut project_source = source(&nested);
+    project_source.recursive = false;
+    let result = scan(&[project_source]);
+    assert_eq!(result.pool.len(), 1);
+    assert!(result.pool[0].path.ends_with("project.json"));
+    Ok(())
+}
+#[test]
+fn live_and_rotation_config_validation_does_not_depend_on_mounted_assets() -> Result<()> {
+    let mut config = Config::default();
+    assert_eq!(config.rotation.interval, "30m");
+    assert!(!config.rotation.include_live);
+    config.live.assets_dir = Some(PathBuf::from("/unmounted/steam/assets"));
+    assert!(config.validate().is_ok());
+    config.live.assets_dir = Some(PathBuf::from("relative/assets"));
+    assert!(config.validate().is_err());
+    config.live.assets_dir = None;
+    config.rotation.interval = "0m".into();
+    assert!(config.validate().is_err());
+    config.rotation.interval = "2h".into();
+    config.live.fps = 0;
+    assert!(config.validate().is_err());
+    config.live.fps = 30;
+    config.live.output = "  ".into();
+    assert!(config.validate().is_err());
+    Ok(())
+}

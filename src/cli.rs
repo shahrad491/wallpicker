@@ -26,4 +26,31 @@ pub enum Command {
     Restore,
     /// Scan sources and print a summary
     Rescan,
+    /// Randomly change wallpapers at a configurable interval (no GUI)
+    Rotate {
+        #[arg(long, value_parser=validate_interval)]
+        interval: Option<String>,
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long, help = "Include videos and Wallpaper Engine projects")]
+        include_live: bool,
+        #[arg(long, help = "Change once immediately and exit")]
+        once: bool,
+    },
+    /// Control wallpicker's tracked live wallpaper
+    Live {
+        #[command(subcommand)]
+        command: LiveCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LiveCommand {
+    /// Stop this app's tracked live player; keep the saved selection for restore
+    Stop,
+}
+fn validate_interval(value: &str) -> Result<String, String> {
+    crate::rotation::parse_interval(value)
+        .map(|_| value.to_owned())
+        .map_err(|error| error.to_string())
 }

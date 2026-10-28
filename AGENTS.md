@@ -6,7 +6,7 @@ Instructions for AI coding agents working on this repository. Read this and `ROA
 
 `wallpicker` is a Rust wallpaper picker for Hyprland/Wayland, replacing a rofi + bash flow. It scans one or more wallpaper directories, maintains manual categories + Favorites + derived folder categories, and applies wallpapers through `awww` (fallback `swaybg`).
 
-**Current state:** planning complete, implementation not started. Start at M0 in `ROADMAP.md`.
+**Current state:** M0–M7 implemented; automated QA/release builds pass. Follow current work and attended desktop acceptance in `ROADMAP.md`.
 
 Full product decisions, data model, CLI contract, and milestones live in `ROADMAP.md`. Do not re-litigate confirmed decisions without asking the user.
 
@@ -134,7 +134,7 @@ config, keybinding, or data-path change must update `README.md` in the same chan
 - Single click selects; double click and Enter apply. This behavior is fixed, not configurable.
 - Esc closes dialog first, then the app.
 - Every destructive action has a confirmation. Deletion of a category/source explains what is and isn't removed.
-- Apply success closes the window and sends one toast. Apply failure leaves the window open with a visible error.
+- Double-click/Enter/toolbar Apply and Random close the window on success. More/right-click → Apply keeps the picker open for testing, updates the Current badge, and sends one toast. Apply failure leaves the window open with a visible error.
 - Keyboard shortcuts: arrows/`hjkl`, `Enter`, `Space`, `R`, `/`, `Ctrl+A`, `Ctrl+D`, `F2`, `Esc`.
 - Never block the UI thread on scanning, thumbnailing, or `awww`. Use iced `Task`/subscriptions.
 
@@ -177,4 +177,4 @@ A task is done only when:
 - `awww`, `awww-daemon`, `magick`, `notify-send`, `zenity`, `kdialog`, `swaybg` are installed.
 - Existing collection: `~/Pictures/wallpaper` (~1,300 images, top-level folders `catppuccin-wallpapers`, `walls-catppuccin-mocha`, `wallpapers`, `gruvbox-wallpapers`).
 - Existing launcher: `$mainMod, W` → old bash script; autostart calls `bash .../wallpaper.sh --restore`.
-- No git repository yet (pending user decision).
+- Git repository exists. Do not create commits unless requested.

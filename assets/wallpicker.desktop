@@ -3,6 +3,7 @@ Type=Application
 Name=Wallpicker
 Comment=Browse and apply wallpapers
 Exec=wallpicker
+Icon=wallpicker
 Terminal=false
 Categories=Utility;Graphics;
 StartupWMClass=wallpicker

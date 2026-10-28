@@ -6,12 +6,20 @@ use std::{
     time::{Instant, SystemTime},
 };
 #[derive(Debug, Clone)]
+pub struct PreviewMetadata {
+    pub path: PathBuf,
+    pub mtime: SystemTime,
+    pub size: u64,
+}
+#[derive(Debug, Clone)]
 pub struct ImageEntry {
     pub path: PathBuf,
     pub mtime: SystemTime,
     pub size: u64,
     pub parent: PathBuf,
     pub source: PathBuf,
+    pub preview: Option<PreviewMetadata>,
+    pub title: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct ScanIssue {
@@ -26,12 +34,7 @@ pub struct ScanResult {
     pub duration: std::time::Duration,
 }
 pub fn supported(path: &Path) -> bool {
-    path.extension().and_then(|s| s.to_str()).is_some_and(|s| {
-        matches!(
-            s.to_ascii_lowercase().as_str(),
-            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff"
-        )
-    })
+    crate::media::supported(path)
 }
 pub fn belongs(path: &Path, source: &Source) -> bool {
     path.starts_with(&source.path)
@@ -42,10 +45,11 @@ pub fn scan(sources: &[Source]) -> ScanResult {
     let mut result = ScanResult::default();
     let mut seen = BTreeSet::new();
     for source in sources {
-        for item in walkdir::WalkDir::new(&source.path)
+        let mut walker = walkdir::WalkDir::new(&source.path)
             .follow_links(false)
             .max_depth(if source.recursive { usize::MAX } else { 1 })
-        {
+            .into_iter();
+        while let Some(item) = walker.next() {
             let item = match item {
                 Ok(i) => i,
                 Err(e) => {
@@ -56,11 +60,33 @@ pub fn scan(sources: &[Source]) -> ScanResult {
                     continue;
                 }
             };
-            if !item.file_type().is_file() || !supported(item.path()) {
+            let mut candidate = item.path().to_path_buf();
+            if item.file_type().is_dir() {
+                let manifest = item.path().join("project.json");
+                if !(source.recursive || item.depth() == 0) || !manifest.is_file() {
+                    continue;
+                }
+                walker.skip_current_dir();
+                candidate = manifest;
+            }
+            if !supported(&candidate)
+                || !candidate
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.is_file())
+            {
+                continue;
+            }
+            if crate::media::is_project(&candidate)
+                && let Err(error) = crate::media::load_project(&candidate)
+            {
+                result.skipped.push(ScanIssue {
+                    path: candidate,
+                    reason: error.to_string(),
+                });
                 continue;
             }
             let entry = (|| -> std::io::Result<ImageEntry> {
-                let path = item.path().canonicalize()?;
+                let path = candidate.canonicalize()?;
                 let meta = path.metadata()?;
                 Ok(ImageEntry {
                     parent: path.parent().unwrap_or(&source.path).into(),
@@ -68,12 +94,34 @@ pub fn scan(sources: &[Source]) -> ScanResult {
                     mtime: meta.modified()?,
                     size: meta.len(),
                     source: source.path.clone(),
+                    preview: if crate::media::is_project(&candidate) {
+                        crate::media::project_preview(&candidate)
+                            .ok()
+                            .and_then(|path| {
+                                let meta = path.metadata().ok()?;
+                                Some(PreviewMetadata {
+                                    mtime: meta.modified().ok()?,
+                                    size: meta.len(),
+                                    path,
+                                })
+                            })
+                    } else {
+                        None
+                    },
+                    title: if crate::media::is_project(&candidate) {
+                        crate::media::load_project(&candidate)
+                            .ok()
+                            .map(|p| p.title)
+                            .filter(|title| !title.is_empty())
+                    } else {
+                        None
+                    },
                 })
             })();
             match entry {
                 Ok(entry) => {
                     if source.auto_categories
-                        && let Ok(rel) = item.path().strip_prefix(&source.path)
+                        && let Ok(rel) = candidate.strip_prefix(&source.path)
                     {
                         let parts: Vec<_> = rel.components().collect();
                         if parts.len() > 1 {
@@ -89,7 +137,7 @@ pub fn scan(sources: &[Source]) -> ScanResult {
                     }
                 }
                 Err(e) => result.skipped.push(ScanIssue {
-                    path: item.path().into(),
+                    path: candidate,
                     reason: e.to_string(),
                 }),
             }

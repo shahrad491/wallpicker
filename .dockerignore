@@ -1,0 +1,33 @@
+# Keep local state, caches, credentials, and host-built binaries out of builds.
+.git
+.git/**
+target
+target/**
+.cache
+.cache/**
+.agents
+.codex
+.aws
+.env
+.env.*
+*.log
+todo.txt
+# Real wallpaper collections never belong in the container context.
+wallpapers
+wallpaper-files
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.webp
+**/*.gif
+**/*.bmp
+**/*.tif
+**/*.tiff
+**/*.mp4
+**/*.webm
+**/*.mkv
+**/*.mov
+**/*.m4v
+**/*.avi
+**/project.json
+# Cargo.lock, src/, tests/, scripts/, docs/, and the SVG icon remain included.

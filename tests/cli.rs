@@ -73,3 +73,23 @@ fn help_and_version_exit_successfully_before_any_side_effects() {
         assert_eq!(error.exit_code(), 0);
     }
 }
+
+#[test]
+fn rotation_and_live_commands_validate_public_options() {
+    use wallpicker::cli::LiveCommand;
+    assert!(
+        matches!(Cli::try_parse_from(["wallpicker","rotate","--interval","30m","--category","favorites","--include-live","--once"]).unwrap().command,Some(Command::Rotate{interval:Some(interval),include_live:true,once:true,..}) if interval=="30m")
+    );
+    assert!(matches!(
+        Cli::try_parse_from(["wallpicker", "live", "stop"])
+            .unwrap()
+            .command,
+        Some(Command::Live {
+            command: LiveCommand::Stop
+        })
+    ));
+    for interval in ["0s", "bad", "366d"] {
+        assert!(Cli::try_parse_from(["wallpicker", "rotate", "--interval", interval]).is_err());
+    }
+    assert!(Cli::try_parse_from(["wallpicker", "live", "start"]).is_err());
+}

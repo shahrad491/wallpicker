@@ -6,9 +6,47 @@ use std::path::Path;
 #[serde(default)]
 pub struct Config {
     pub behavior: Behavior,
+    pub live: Live,
+    pub rotation: Rotation,
     pub thumbs: Thumbs,
     pub window: Window,
     pub theme: Palette,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Live {
+    pub output: String,
+    pub fps: u32,
+    pub muted: bool,
+    pub assets_dir: Option<std::path::PathBuf>,
+}
+impl Default for Live {
+    fn default() -> Self {
+        Self {
+            output: "ALL".into(),
+            fps: 30,
+            muted: true,
+            assets_dir: None,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rotation {
+    pub interval: String,
+    pub category: Option<String>,
+    pub include_live: bool,
+    pub notify: bool,
+}
+impl Default for Rotation {
+    fn default() -> Self {
+        Self {
+            interval: "30m".into(),
+            category: None,
+            include_live: false,
+            notify: false,
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -109,6 +147,31 @@ impl Config {
         super::model::store::atomic_write(path, toml::to_string_pretty(self)?.as_bytes())
     }
     pub fn validate(&self) -> Result<()> {
+        crate::rotation::parse_interval(&self.rotation.interval)?;
+        if self
+            .rotation
+            .category
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            bail!("Rotation category cannot be empty; omit it to use the last selected category")
+        }
+        if !(1..=144).contains(&self.live.fps)
+            || self.live.output.trim().is_empty()
+            || self.live.output.len() > 128
+            || self.live.output.chars().any(char::is_control)
+        {
+            bail!("Live wallpapers need a monitor name or ALL, and FPS between 1 and 144")
+        }
+        if self
+            .live
+            .assets_dir
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            bail!("Wallpaper Engine assets_dir must be an absolute path")
+        }
+
         if self.thumbs.width == 0
             || self.thumbs.height == 0
             || self.thumbs.width > 4096

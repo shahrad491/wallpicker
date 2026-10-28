@@ -1,11 +1,13 @@
 //! Wallpaper backend with injectable paths, legacy state compatibility and safe PID tracking.
 use crate::{
     config::Config,
+    media::{self, MediaKind},
     model::{CategoryRef, Library, ScanResult, scan, store::atomic_write},
     paths::Paths,
 };
 use anyhow::{Context, Result, bail};
 use rand::seq::IndexedRandom;
+use serde::{Deserialize, Serialize};
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -43,6 +45,9 @@ pub struct Tools {
     pub daemon: PathBuf,
     pub swaybg: PathBuf,
     pub notify: PathBuf,
+    pub mpvpaper: PathBuf,
+    pub wallpaper_engine: PathBuf,
+    pub hyprctl: PathBuf,
 }
 impl Default for Tools {
     fn default() -> Self {
@@ -51,8 +56,19 @@ impl Default for Tools {
             daemon: "awww-daemon".into(),
             swaybg: "swaybg".into(),
             notify: "notify-send".into(),
+            mpvpaper: "mpvpaper".into(),
+            wallpaper_engine: "linux-wallpaperengine".into(),
+            hyprctl: "hyprctl".into(),
         }
     }
+}
+/// Identity recorded only for a foreground player started by this application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveProcess {
+    pid: u32,
+    start: String,
+    executable: PathBuf,
+    kind: String,
 }
 #[derive(Clone)]
 pub struct Backend {
@@ -136,9 +152,7 @@ impl Backend {
             .contains(&opts.transition.as_str()),
             "Invalid transition"
         );
-        let path = path
-            .canonicalize()
-            .with_context(|| format!("Image missing: {}", path.display()))?;
+        let path = media::canonical_wallpaper(path)?;
         anyhow::ensure!(path.is_file(), "Wallpaper is not a file");
         File::open(&path).context("Wallpaper is unreadable")?;
         fs::create_dir_all(&self.runtime)?;
@@ -151,25 +165,34 @@ impl Backend {
             .open(self.runtime.join(format!("{}.apply.lock", self.session)))?;
         lock.lock()?;
         let old = self.read_pid();
-        let animated = if executable(&self.tools.awww).is_some() {
-            match self.apply_awww(&path, opts) {
-                Ok(()) => true,
-                Err(error) => {
-                    log::warn!("awww failed, trying swaybg: {error:#}");
-                    false
+        let previous_live = self.read_live()?;
+        if media::kind(&path) != MediaKind::Image {
+            self.apply_live(&path, previous_live.as_ref(), old)?;
+        } else {
+            let animated = if executable(&self.tools.awww).is_some() {
+                match self.apply_awww(&path, opts) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::warn!("awww failed, trying swaybg: {error:#}");
+                        false
+                    }
                 }
+            } else {
+                false
+            };
+            if animated {
+                atomic_write(&self.paths.state, path.as_os_str().as_bytes())?;
+                if let Some((pid, start)) = old {
+                    self.stop_static(pid, &start)
+                }
+                let _ = fs::remove_file(self.pid_path());
+            } else {
+                self.apply_static(&path, old)?;
             }
-        } else {
-            false
-        };
-        if animated {
-            atomic_write(&self.paths.state, path.as_os_str().as_bytes())?;
-            if let Some((pid, start)) = old {
-                self.stop_static(pid, &start)
+            if let Some(process) = previous_live {
+                self.stop_process(&process)?;
+                let _ = fs::remove_file(self.live_path());
             }
-            let _ = fs::remove_file(self.pid_path());
-        } else {
-            self.apply_static(&path, old)?;
         }
         drop(lock);
         if opts.notify {
@@ -181,6 +204,204 @@ impl Backend {
                     .to_string_lossy(),
                 false,
             )
+        }
+        Ok(())
+    }
+    fn live_path(&self) -> PathBuf {
+        self.runtime.join(format!("{}.live.json", self.session))
+    }
+    fn read_live(&self) -> Result<Option<LiveProcess>> {
+        match fs::read(self.live_path()) {
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes)
+                    .context("Invalid live-process record; refusing to overwrite it")?,
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn live_arguments(&self, path: &Path) -> Result<(PathBuf, Vec<OsString>, String)> {
+        match media::kind(path) {
+            MediaKind::Video => {
+                anyhow::ensure!(
+                    executable(&self.tools.mpvpaper).is_some(),
+                    "Video wallpapers require mpvpaper. Install mpvpaper, then try again."
+                );
+                let audio = if self.config.live.muted {
+                    "no-audio"
+                } else {
+                    "audio=yes"
+                };
+                let options = format!(
+                    "no-config {audio} loop-file=inf hwdec=auto terminal=no vf=lavfi=[fps={}]",
+                    self.config.live.fps
+                );
+                Ok((
+                    self.tools.mpvpaper.clone(),
+                    vec![
+                        "-o".into(),
+                        options.into(),
+                        self.config.live.output.clone().into(),
+                        path.as_os_str().into(),
+                    ],
+                    "video".into(),
+                ))
+            }
+            MediaKind::WallpaperEngine => {
+                anyhow::ensure!(
+                    executable(&self.tools.wallpaper_engine).is_some(),
+                    "Wallpaper Engine projects require linux-wallpaperengine (Almamu) and assets from your licensed Steam installation. Install that backend, then try again."
+                );
+                let directory = media::project_directory(path)?;
+                let mut args: Vec<OsString> = vec![
+                    "--fps".into(),
+                    self.config.live.fps.to_string().into(),
+                    "--scaling".into(),
+                    "fill".into(),
+                ];
+                if self.config.live.muted {
+                    args.push("--silent".into());
+                }
+                if let Some(assets) = &self.config.live.assets_dir {
+                    anyhow::ensure!(
+                        assets.is_dir(),
+                        "live.assets_dir must point to the Wallpaper Engine assets directory"
+                    );
+                    args.push("--assets-dir".into());
+                    args.push(assets.as_os_str().into());
+                }
+                let outputs = if self.config.live.output.eq_ignore_ascii_case("ALL")
+                    || self.config.live.output == "*"
+                {
+                    let result=Command::new(&self.tools.hyprctl).args(["monitors","-j"]).output().context("Cannot discover Wallpaper Engine outputs; set live.output to a monitor name such as eDP-1")?;
+                    anyhow::ensure!(
+                        result.status.success(),
+                        "Cannot discover Wallpaper Engine outputs; set live.output to an explicit monitor name"
+                    );
+                    let monitors: Vec<serde_json::Value> = serde_json::from_slice(&result.stdout)
+                        .context(
+                        "Invalid monitor list; set live.output to an explicit monitor name",
+                    )?;
+                    let mut outputs = Vec::new();
+                    for monitor in monitors {
+                        if monitor.get("disabled").and_then(|v| v.as_bool()) == Some(true) {
+                            continue;
+                        }
+                        if let Some(name) = monitor
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .filter(|name| !name.is_empty())
+                            && !outputs.iter().any(|v| v == name)
+                        {
+                            outputs.push(name.to_string());
+                        }
+                    }
+                    anyhow::ensure!(
+                        !outputs.is_empty(),
+                        "No active monitors found; set live.output to an explicit monitor name"
+                    );
+                    outputs
+                } else {
+                    vec![self.config.live.output.clone()]
+                };
+                for output in outputs {
+                    args.extend([
+                        "--screen-root".into(),
+                        output.into(),
+                        "--bg".into(),
+                        directory.as_os_str().into(),
+                    ]);
+                }
+                Ok((
+                    self.tools.wallpaper_engine.clone(),
+                    args,
+                    "wallpaper_engine".into(),
+                ))
+            }
+            MediaKind::Image => bail!("Image wallpapers do not need a live backend"),
+        }
+    }
+    fn apply_live(
+        &self,
+        path: &Path,
+        previous: Option<&LiveProcess>,
+        old_static: Option<(u32, String)>,
+    ) -> Result<()> {
+        let (tool, args, kind) = self.live_arguments(path)?;
+        let borrowed: Vec<_> = args.iter().map(OsString::as_os_str).collect();
+        let mut child = self.spawn_detached(&tool, &borrowed, "live")?;
+        std::thread::sleep(Duration::from_millis(500));
+        anyhow::ensure!(
+            child.try_wait()?.is_none(),
+            "Live wallpaper backend exited before it was ready. See {}",
+            self.paths
+                .cache
+                .join(format!("{}.live.log", self.session))
+                .display()
+        );
+        let result = (|| -> Result<()> {
+            let pid = child.id();
+            let start =
+                process_start(pid).context("Live wallpaper backend exited before it was ready")?;
+            let executable = fs::read_link(format!("/proc/{pid}/exe"))?;
+            let record = LiveProcess {
+                pid,
+                start,
+                executable,
+                kind,
+            };
+            self.publish_selection(path, &self.live_path(), &serde_json::to_vec(&record)?)
+        })();
+        if let Err(error) = result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        reap(child);
+        if let Some(previous) = previous {
+            self.stop_process(previous)?;
+        }
+        if let Some((pid, start)) = old_static {
+            self.stop_static(pid, &start);
+            let _ = fs::remove_file(self.pid_path());
+        }
+        Ok(())
+    }
+    fn stop_process(&self, process: &LiveProcess) -> Result<()> {
+        // A stale PID can point at an unrelated process after reuse; check both identities.
+        if process_start(process.pid).as_deref() != Some(process.start.as_str())
+            || fs::read_link(format!("/proc/{}/exe", process.pid))
+                .ok()
+                .as_ref()
+                != Some(&process.executable)
+        {
+            return Ok(());
+        }
+        let status = Command::new("kill")
+            .args(["-TERM", "--", &process.pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        anyhow::ensure!(
+            status.success() || process_start(process.pid).is_none(),
+            "Could not stop the previous live wallpaper process"
+        );
+        Ok(())
+    }
+    /// Stop only this application's tracked live player; keep the saved selection for restore.
+    pub fn stop_live(&self) -> Result<()> {
+        fs::create_dir_all(&self.runtime)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(self.runtime.join(format!("{}.apply.lock", self.session)))?;
+        lock.lock()?;
+        if let Some(process) = self.read_live()? {
+            self.stop_process(&process)?;
+            fs::remove_file(self.live_path())?;
         }
         Ok(())
     }
@@ -212,7 +433,10 @@ impl Backend {
                 bail!("awww daemon did not become ready")
             }
             reap(daemon);
-            if let Some(current) = self.current().filter(|p| p.is_file()) {
+            if let Some(current) = self
+                .current()
+                .filter(|p| p.is_file() && media::kind(p) == MediaKind::Image)
+            {
                 let _ = Command::new(&self.tools.awww)
                     .args([
                         "img",
@@ -333,6 +557,18 @@ impl Backend {
     // Publish the PID first, then the authoritative current path. If saving current
     // fails, restore both records before terminating the new process.
     fn save_static_selection(&self, path: &Path, pid: u32, start: &str) -> Result<()> {
+        self.publish_selection(
+            path,
+            &self.pid_path(),
+            format!("{pid} {start}\n").as_bytes(),
+        )
+    }
+    fn publish_selection(
+        &self,
+        path: &Path,
+        record_path: &Path,
+        record_bytes: &[u8],
+    ) -> Result<()> {
         fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
             match fs::read(path) {
                 Ok(bytes) => Ok(Some(bytes)),
@@ -340,11 +576,14 @@ impl Backend {
                 Err(error) => Err(error.into()),
             }
         }
-        let pid_path = self.pid_path();
+        let pid_path = record_path.to_path_buf();
         let previous_pid = read_optional(&pid_path)?;
         let previous_state = read_optional(&self.paths.state)?;
-        atomic_write(&pid_path, format!("{pid} {start}\n").as_bytes())?;
-        if let Err(error) = atomic_write(&self.paths.state, path.as_os_str().as_bytes()) {
+        let publication = (|| -> Result<()> {
+            atomic_write(&pid_path, record_bytes)?;
+            atomic_write(&self.paths.state, path.as_os_str().as_bytes())
+        })();
+        if let Err(error) = publication {
             for (record, previous) in [
                 (&pid_path, previous_pid),
                 (&self.paths.state, previous_state),
@@ -511,8 +750,15 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     fn script(path: &Path, contents: &str) {
-        fs::write(path, format!("#!/bin/sh\n{contents}\n")).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        use std::io::Write;
+        // Publish a closed executable inode; in-place rewrites can race parallel execs.
+        let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+        write!(temporary, "#!/bin/sh\n{contents}\n").unwrap();
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .unwrap();
+        temporary.into_temp_path().persist(path).unwrap();
     }
     fn fixture() -> (tempfile::TempDir, Backend, PathBuf) {
         let root = tempfile::tempdir().unwrap();
@@ -522,6 +768,9 @@ mod tests {
             daemon: root.path().join("daemon"),
             swaybg: root.path().join("swaybg"),
             notify: root.path().join("notify"),
+            mpvpaper: root.path().join("mpvpaper"),
+            wallpaper_engine: root.path().join("linux-wallpaperengine"),
+            hyprctl: root.path().join("hyprctl"),
         };
         script(&tools.awww, "exit 0");
         script(&tools.daemon, "exit 0");
@@ -755,6 +1004,180 @@ mod tests {
         assert_eq!(
             backend.random(&CategoryRef::Manual { id }, true).unwrap(),
             image
+        );
+    }
+    struct StopLiveOnDrop(Backend);
+    impl Drop for StopLiveOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.stop_live();
+        }
+    }
+    #[test]
+    fn video_arguments_mute_loop_and_track_only_owned_player() {
+        let (root, backend, _image) = fixture();
+        let _cleanup = StopLiveOnDrop(backend.clone());
+        let video = root.path().join("a video.mp4");
+        fs::write(&video, b"video").unwrap();
+        let args = root.path().join("video-args");
+        script(
+            &backend.tools.mpvpaper,
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'; exec sleep 30",
+                args.display()
+            ),
+        );
+        backend.apply(&video).unwrap();
+        let process = backend.read_live().unwrap().unwrap();
+        assert_eq!(process.kind, "video");
+        assert_eq!(backend.current(), Some(video.clone()));
+        let args = fs::read_to_string(args).unwrap();
+        assert!(args.contains("no-config no-audio loop-file=inf"));
+        assert!(args.contains("fps=30"));
+        assert!(args.contains("ALL"));
+        assert!(args.contains(video.to_str().unwrap()));
+        backend.stop_live().unwrap();
+        assert!(!backend.live_path().exists());
+        assert_eq!(backend.current(), Some(video));
+    }
+    #[test]
+    fn missing_live_backend_preserves_current_wallpaper() {
+        let (root, backend, image) = fixture();
+        backend.apply(&image).unwrap();
+        let video = root.path().join("video.mp4");
+        fs::write(&video, b"video").unwrap();
+        let error = backend.apply(&video).unwrap_err();
+        assert!(error.to_string().contains("mpvpaper"));
+        assert_eq!(backend.current(), Some(image));
+    }
+    #[test]
+    fn wallpaper_engine_all_outputs_use_individual_screen_assignments() {
+        let (root, mut backend, _image) = fixture();
+        let _cleanup = StopLiveOnDrop(backend.clone());
+        let project = root.path().join("project.json");
+        fs::write(&project, r#"{"type":"scene","file":"scene.pkg"}"#).unwrap();
+        let args = root.path().join("engine-args");
+        let assets = root.path().join("assets");
+        fs::create_dir(&assets).unwrap();
+        backend.config.live.assets_dir = Some(assets.clone());
+        script(
+            &backend.tools.wallpaper_engine,
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'; exec sleep 30",
+                args.display()
+            ),
+        );
+        script(
+            &backend.tools.hyprctl,
+            r#"printf '%s' '[{"name":"eDP-1"},{"name":"DP-2"},{"name":"OFF","disabled":true}]'"#,
+        );
+        backend.apply(root.path()).unwrap();
+        let args = fs::read_to_string(args).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        assert!(args.contains(&"--silent"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--assets-dir", assets.to_str().unwrap()])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--screen-root", "eDP-1"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--screen-root", "DP-2"])
+        );
+        assert!(!args.contains(&"OFF"));
+        assert_eq!(backend.current(), Some(project));
+    }
+    #[test]
+    fn failed_live_start_keeps_previous_selection_and_tracking() {
+        let (root, backend, image) = fixture();
+        backend.apply(&image).unwrap();
+        let video = root.path().join("video.mp4");
+        fs::write(&video, b"video").unwrap();
+        script(&backend.tools.mpvpaper, "exit 1");
+        assert!(backend.apply(&video).is_err());
+        assert_eq!(backend.current(), Some(image));
+        assert!(!backend.live_path().exists());
+    }
+    #[test]
+    fn switching_to_static_stops_owned_live_process() {
+        let (root, backend, image) = fixture();
+        let _cleanup = StopLiveOnDrop(backend.clone());
+        let video = root.path().join("video.mp4");
+        fs::write(&video, b"video").unwrap();
+        script(&backend.tools.mpvpaper, "exec sleep 30");
+        backend.apply(&video).unwrap();
+        backend.apply(&image).unwrap();
+        assert!(!backend.live_path().exists());
+        assert_eq!(backend.current(), Some(image));
+    }
+    #[test]
+    fn stale_live_identity_never_kills_unrelated_process() {
+        let (root, backend, _image) = fixture();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let process = LiveProcess {
+            pid: child.id(),
+            start: "incorrect start time".into(),
+            executable: fs::read_link(format!("/proc/{}/exe", child.id())).unwrap(),
+            kind: "video".into(),
+        };
+        fs::create_dir_all(&backend.runtime).unwrap();
+        atomic_write(&backend.live_path(), &serde_json::to_vec(&process).unwrap()).unwrap();
+        backend.stop_live().unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        let wrong_executable = LiveProcess {
+            pid: child.id(),
+            start: process_start(child.id()).unwrap(),
+            executable: root.path().join("unrelated-executable"),
+            kind: "video".into(),
+        };
+        atomic_write(
+            &backend.live_path(),
+            &serde_json::to_vec(&wrong_executable).unwrap(),
+        )
+        .unwrap();
+        backend.stop_live().unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(root);
+    }
+    #[test]
+    fn restore_restarts_saved_video_without_notification() {
+        let (root, backend, _image) = fixture();
+        let _cleanup = StopLiveOnDrop(backend.clone());
+        let video = root.path().join("restore.mp4");
+        fs::write(&video, b"video").unwrap();
+        script(&backend.tools.mpvpaper, "exec sleep 30");
+        backend.apply(&video).unwrap();
+        let previous = backend.read_live().unwrap().unwrap().pid;
+        backend.stop_live().unwrap();
+        backend.restore().unwrap();
+        assert_ne!(backend.read_live().unwrap().unwrap().pid, previous);
+        assert_eq!(backend.current(), Some(video));
+    }
+    #[test]
+    fn explicit_output_and_unmuted_live_options_need_no_monitor_discovery() {
+        let (root, mut backend, _image) = fixture();
+        backend.config.live.output = "DP-1".into();
+        backend.config.live.muted = false;
+        let video = root.path().join("video.mp4");
+        fs::write(&video, b"video").unwrap();
+        script(&backend.tools.mpvpaper, "exit 0");
+        let (_, args, _) = backend.live_arguments(&video).unwrap();
+        let options = args[1].to_string_lossy();
+        assert!(options.contains("audio=yes"));
+        assert!(!options.contains("no-audio"));
+        assert_eq!(args[2], "DP-1");
+        let project = root.path().join("project.json");
+        fs::write(&project, r#"{"type":"scene","file":"scene.pkg"}"#).unwrap();
+        script(&backend.tools.wallpaper_engine, "exit 0");
+        let (_, args, _) = backend.live_arguments(&project).unwrap();
+        assert!(!args.iter().any(|arg| arg == "--silent"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--screen-root", "DP-1"])
         );
     }
 }

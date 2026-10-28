@@ -1,16 +1,20 @@
 //! Bounded background thumbnail workers; full-size decoding never occurs in the UI.
 use crate::{
     config::Thumbs,
+    media::{self, MediaKind},
     model::{ImageEntry, store::atomic_write},
 };
 use anyhow::{Context, Result};
 use image::{ImageDecoder, ImageReader, codecs::jpeg::JpegEncoder};
 use std::{
     collections::{HashMap, HashSet},
+    fs::OpenOptions,
     os::unix::ffi::OsStrExt,
-    path::PathBuf,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, Mutex, mpsc},
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +38,8 @@ struct Inner {
     cache: PathBuf,
     config: Thumbs,
     workers: rayon::ThreadPool,
+    ffmpeg: PathBuf,
+    video_timeout: Duration,
     status: Mutex<Status>,
     tx: mpsc::Sender<ThumbnailEvent>,
     rx: Mutex<mpsc::Receiver<ThumbnailEvent>>,
@@ -44,6 +50,10 @@ pub struct Thumbnailer {
 }
 impl Thumbnailer {
     pub fn new(cache: PathBuf, config: Thumbs) -> Result<Self> {
+        Self::with_ffmpeg(cache, config, PathBuf::from("ffmpeg"))
+    }
+    /// Injectable optional video decoder. Image/project previews do not need FFmpeg.
+    pub fn with_ffmpeg(cache: PathBuf, config: Thumbs, ffmpeg: PathBuf) -> Result<Self> {
         anyhow::ensure!(
             config.workers > 0
                 && config.workers <= 32
@@ -60,6 +70,8 @@ impl Thumbnailer {
             inner: Arc::new(Inner {
                 cache,
                 config: config.clone(),
+                ffmpeg,
+                video_timeout: Duration::from_secs(10),
                 workers: rayon::ThreadPoolBuilder::new()
                     .num_threads(config.workers)
                     .thread_name(|i| format!("thumbnail-{i}"))
@@ -81,6 +93,17 @@ impl Thumbnailer {
         hash.update(&self.inner.config.width.to_le_bytes());
         hash.update(&self.inner.config.height.to_le_bytes());
         hash.update(&[self.inner.config.quality]);
+        if media::kind(&entry.path) == MediaKind::WallpaperEngine {
+            if let Some(preview) = &entry.preview {
+                hash.update(preview.path.as_os_str().as_bytes());
+                hash.update(&preview.size.to_le_bytes());
+                let mtime = preview.mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
+                hash.update(&mtime.as_secs().to_le_bytes());
+                hash.update(&mtime.subsec_nanos().to_le_bytes());
+            } else {
+                hash.update(b"missing project preview; rescan required");
+            }
+        }
         hash.finalize().to_hex().to_string()
     }
     fn target(&self, entry: &ImageEntry) -> PathBuf {
@@ -151,7 +174,21 @@ impl Thumbnailer {
         if let Some(path) = self.cached(entry) {
             return Ok(path);
         }
-        let mut decoder = ImageReader::open(&entry.path)?
+        let temporary;
+        let input = match media::kind(&entry.path) {
+            MediaKind::Image => entry.path.clone(),
+            MediaKind::WallpaperEngine => entry
+                .preview
+                .as_ref()
+                .context("Project preview unavailable; add a preview image and rescan sources")?
+                .path
+                .clone(),
+            MediaKind::Video => {
+                temporary = self.video_frame(&entry.path)?;
+                temporary.0.clone()
+            }
+        };
+        let mut decoder = ImageReader::open(&input)?
             .with_guessed_format()?
             .into_decoder()
             .with_context(|| format!("Decoding {}", entry.path.display()))?;
@@ -196,6 +233,74 @@ impl Thumbnailer {
         atomic_write(&target, &bytes)?;
         Ok(target)
     }
+    fn video_frame(&self, path: &Path) -> Result<TemporaryFrame> {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let output = self
+            .inner
+            .cache
+            .join(format!(".video-{}-{stamp}.png", std::process::id()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&output)?;
+        drop(file);
+        let temporary = TemporaryFrame(output);
+        let filter = format!(
+            "scale={}:{}:force_original_aspect_ratio=increase,crop={}:{}",
+            self.inner.config.width,
+            self.inner.config.height,
+            self.inner.config.width,
+            self.inner.config.height
+        );
+        let mut child = Command::new(&self.inner.ffmpeg)
+            .args([
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-y",
+                "-threads",
+                "1",
+                "-i",
+            ])
+            .arg(path)
+            .args(["-frames:v", "1", "-vf", &filter, "-an", "-threads", "1"])
+            .arg(&temporary.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Video previews require ffmpeg; install it or choose an image wallpaper")?;
+        let deadline = Instant::now() + self.inner.video_timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    anyhow::ensure!(
+                        status.success(),
+                        "ffmpeg could not decode the first video frame"
+                    );
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "Video preview decoding timed out after {} seconds",
+                        self.inner.video_timeout.as_secs()
+                    );
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(temporary)
+    }
     /// Explicit maintenance action; removes only this service's orphaned hash JPEGs.
     pub fn cleanup(&self, entries: &[ImageEntry]) -> Result<usize> {
         let live: HashSet<_> = entries.iter().map(|e| self.target(e)).collect();
@@ -214,6 +319,14 @@ impl Thumbnailer {
             }
         }
         Ok(count)
+    }
+}
+
+/// Owns only a decoder-generated file inside the thumbnail cache.
+struct TemporaryFrame(PathBuf);
+impl Drop for TemporaryFrame {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -420,5 +533,170 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+    #[test]
+    fn thumbnails_preserve_neutral_and_saturated_srgb_colors() {
+        let (dir, thumbs, mut entry) = fixture();
+        // A gamma lift or a tint changes these flat fields even without image detail.
+        // JPEG's RGB↔YCbCr quantization can change a channel by a few code values.
+        let colors = [
+            [0, 0, 0],
+            [32, 32, 32],
+            [64, 64, 64],
+            [128, 128, 128],
+            [192, 192, 192],
+            [255, 255, 255],
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [105, 212, 205],
+            [21, 32, 38],
+        ];
+        for (index, color) in colors.into_iter().enumerate() {
+            let path = dir.path().join("source").join(format!("color-{index}.png"));
+            image::RgbImage::from_pixel(3, 2, image::Rgb(color))
+                .save(&path)
+                .unwrap();
+            entry.path = path.canonicalize().unwrap();
+            let metadata = entry.path.metadata().unwrap();
+            entry.mtime = metadata.modified().unwrap();
+            entry.size = metadata.len();
+            let cached = thumbs.generate(&entry).unwrap();
+            let actual = image::open(cached).unwrap().to_rgb8();
+            for pixel in actual.pixels() {
+                for channel in 0..3 {
+                    assert!(
+                        pixel[channel].abs_diff(color[channel]) <= 4,
+                        "source {color:?}, thumbnail {:?}",
+                        pixel.0
+                    );
+                }
+            }
+        }
+    }
+    fn mock_tool(path: &Path, body: &str) {
+        use std::{io::Write, os::unix::fs::PermissionsExt};
+        let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+        write!(temporary, "#!/bin/sh\n{body}\n").unwrap();
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        temporary.into_temp_path().persist(path).unwrap();
+    }
+    fn entry_for(path: &Path) -> ImageEntry {
+        let path = path.canonicalize().unwrap();
+        let metadata = path.metadata().unwrap();
+        let parent = path.parent().unwrap().to_path_buf();
+        ImageEntry {
+            path,
+            mtime: metadata.modified().unwrap(),
+            size: metadata.len(),
+            parent: parent.clone(),
+            source: parent,
+            preview: None,
+            title: None,
+        }
+    }
+    #[test]
+    fn video_first_frame_uses_optional_decoder_and_cleans_temporary_output() {
+        let (dir, _thumbs, image) = fixture();
+        let video = dir.path().join("video with spaces.mp4");
+        std::fs::write(&video, b"mock video").unwrap();
+        let tool = dir.path().join("ffmpeg");
+        let args = dir.path().join("args");
+        mock_tool(
+            &tool,
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'; for last; do :; done; cp '{}' \"$last\"",
+                args.display(),
+                image.path.display()
+            ),
+        );
+        let cache = dir.path().join("video-cache");
+        let thumbs = Thumbnailer::with_ffmpeg(cache.clone(), Thumbs::default(), tool).unwrap();
+        let output = thumbs.generate(&entry_for(&video)).unwrap();
+        assert_eq!(image::image_dimensions(output).unwrap(), (400, 225));
+        let args = std::fs::read_to_string(args).unwrap();
+        assert!(args.contains(video.to_str().unwrap()));
+        assert!(args.contains("-frames:v\n1"));
+        assert!(!std::fs::read_dir(cache).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".video-")
+        }));
+    }
+    #[test]
+    fn missing_video_decoder_fails_actionably_and_does_not_cache() {
+        let (dir, _thumbs, _image) = fixture();
+        let video = dir.path().join("video.webm");
+        std::fs::write(&video, b"mock video").unwrap();
+        let thumbs = Thumbnailer::with_ffmpeg(
+            dir.path().join("video-cache"),
+            Thumbs::default(),
+            dir.path().join("missing-ffmpeg"),
+        )
+        .unwrap();
+        let entry = entry_for(&video);
+        let error = thumbs.generate(&entry).unwrap_err();
+        assert!(error.to_string().contains("ffmpeg"));
+        assert!(thumbs.cached(&entry).is_none());
+    }
+    #[test]
+    fn video_preview_timeout_kills_decoder() {
+        let (dir, _thumbs, _image) = fixture();
+        let video = dir.path().join("video.mkv");
+        std::fs::write(&video, b"mock video").unwrap();
+        let tool = dir.path().join("ffmpeg");
+        mock_tool(&tool, "exec sleep 30");
+        let mut thumbs =
+            Thumbnailer::with_ffmpeg(dir.path().join("video-cache"), Thumbs::default(), tool)
+                .unwrap();
+        Arc::get_mut(&mut thumbs.inner).unwrap().video_timeout = Duration::from_millis(20);
+        let start = Instant::now();
+        let error = thumbs.generate(&entry_for(&video)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+    #[test]
+    fn project_preview_metadata_invalidates_cached_thumbnail() {
+        use std::io::Write;
+        let (dir, _thumbs, _image) = fixture();
+        let project = dir.path().join("project.json");
+        let preview = dir.path().join("preview.png");
+        std::fs::write(
+            &project,
+            r#"{"type":"scene","file":"scene.pkg","preview":"preview.png"}"#,
+        )
+        .unwrap();
+        image::RgbImage::new(3, 2).save(&preview).unwrap();
+        let thumbs = Thumbnailer::new(dir.path().join("project-cache"), Thumbs::default()).unwrap();
+        let mut entry = entry_for(&project);
+        let metadata = preview.metadata().unwrap();
+        entry.preview = Some(crate::model::scan::PreviewMetadata {
+            path: preview.clone(),
+            mtime: metadata.modified().unwrap(),
+            size: metadata.len(),
+        });
+        let first_key = thumbs.key(&entry);
+        thumbs.generate(&entry).unwrap();
+        assert!(thumbs.cached(&entry).is_some());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&preview)
+            .unwrap()
+            .write_all(b"new preview metadata")
+            .unwrap();
+        let metadata = preview.metadata().unwrap();
+        entry.preview = Some(crate::model::scan::PreviewMetadata {
+            path: preview.clone(),
+            mtime: metadata.modified().unwrap(),
+            size: metadata.len(),
+        });
+        assert_ne!(first_key, thumbs.key(&entry));
+        assert!(thumbs.cached(&entry).is_none());
+        thumbs.generate(&entry).unwrap();
     }
 }

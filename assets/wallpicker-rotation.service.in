@@ -1,0 +1,17 @@
+[Unit]
+Description=Rotate wallpapers with wallpicker
+ConditionEnvironment=WAYLAND_DISPLAY
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart="@EXECUTABLE@" rotate
+Restart=on-failure
+RestartSec=5
+# Detached wallpaper backends keep the current wallpaper when rotation is stopped.
+# wallpicker tracks backend ownership separately for safe replacement.
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target
